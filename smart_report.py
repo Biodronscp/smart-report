@@ -1272,7 +1272,9 @@ def manage_filiais():
 
 @app.route('/api/export-config', methods=['GET'])
 def export_config():
-    """Exporta configs globais + usuários + laudos como JSON (apenas admin)."""
+    """Exporta TUDO (config global, usuários, laudos, OS/osDrafts, filiais) como JSON —
+    backup completo self-contained, apenas admin. Usado pela rotina de backup local
+    (watcher.py) e pelo botão "Exportar Backup" do admin."""
     user, full_data, err = _require_admin()
     if err:
         return err
@@ -1280,6 +1282,8 @@ def export_config():
         "globalConfig": full_data.get('globalConfig', {}),
         "users": full_data.get('users', {}),  # cuidado: inclui hashes de senha
         "laudos": _inflate_laudos_map(full_data.get('laudos', {})),  # reinfla fotos -> backup self-contained
+        "userStates": full_data.get('userStates', {}),  # osDrafts (OS/serviços) por usuário
+        "filiais": full_data.get('filiais', {}),  # cuidado: inclui Omie App Secret por filial
         "exportedAt": datetime.utcnow().isoformat() + "Z"
     })
 
@@ -1299,6 +1303,8 @@ def import_config():
         full_data['laudos'] = payload['laudos']
     if 'userStates' in payload:
         full_data['userStates'] = payload['userStates']
+    if 'filiais' in payload:
+        full_data['filiais'] = payload['filiais']
     save_data(full_data)
     return jsonify({"success": True})
 
@@ -2870,6 +2876,23 @@ def _strip_part_photos(draft):
     return {**draft, 'parts': novas} if pesado else draft
 
 
+def _nome_conta_crm(n_cod_conta):
+    """Nome do CLIENTE da oportunidade (Conta do CRM), com cache.
+
+    Antes a bancada usava `cDesOp.split(' - ')[0]` como "cliente" — mas o título da
+    oportunidade é "SERIE - EQUIPAMENTO - SERVIÇO" (ex.: "64TBL61002001V - DRONE T40 -
+    REVISÃO GERAL"), então o técnico via o NÚMERO DE SÉRIE no lugar do nome do cliente."""
+    if not n_cod_conta:
+        return ''
+    ck = f"crm_conta_nome_{n_cod_conta}"
+    v = _cache_get(ck)
+    if v is None:
+        conta = _crm_resolver_conta(n_cod_conta)
+        v = (conta or {}).get('nome') or '—'
+        _cache_set(ck, v)
+    return '' if v == '—' else v
+
+
 def _resumo_laudo(full_data, owner, draft):
     """Parecer técnico da IA (o que fazer no equipamento) pra mostrar na bancada.
     Preferência: o texto capturado na própria OS (fromLaudo.laudoTecnico, nas OS novas);
@@ -2929,10 +2952,16 @@ def os_bancada():
         elif candidatos and any((d.get('execEstado') or 'a_executar') in ('aguardando_teste', 'aprovado') for _o, d in candidatos):
             # já foi pro teste/liberação -> some da bancada
             continue
+        # CLIENTE de verdade: Conta do CRM da oportunidade. Cai pro cliente da OS do app
+        # e, em último caso, pro 1º pedaço do título (que costuma ser o nº de série).
+        cliente_nome = _nome_conta_crm(ident.get('nCodConta'))
+        if not cliente_nome and escolha is not None:
+            cliente_nome = ((escolha.get('client') or {}).get('name') or '').strip()
         entry = {
             "crmOpNum": num,
-            "cliente": c_des.split(' - ')[0] if ' - ' in c_des else (c_des or 'Sem cliente'),
+            "cliente": cliente_nome or (c_des.split(' - ')[0] if ' - ' in c_des else (c_des or 'Sem cliente')),
             "equipamento": equipamento or '',
+            "serie": _serial or '',
             "descricao": c_des,
         }
         if escolha is not None:
@@ -5305,6 +5334,7 @@ HTML_PAGE = """
             // Aba "Serviços a executar" (só OS na fase 03 Em Preparação)
             const FASE_PREPARACAO = 10843780552;
             const [execAbertaId, setExecAbertaId] = useState(null);
+            const [resumoAberto, setResumoAberto] = useState({});   // "ver laudo completo" por OS
             const [execOs, setExecOs] = useState(null);
             const [execCarregando, setExecCarregando] = useState(false);
             const [execPecasSalvando, setExecPecasSalvando] = useState(false);
@@ -5579,9 +5609,9 @@ HTML_PAGE = """
                 }
             }, [activeTab, auth]);
 
-            // Painel "Fila do robô" (aba Templates, admin): busca ao entrar e atualiza a cada 20s
+            // Painel "Fila do robô" (aba Robô, admin): busca ao entrar e atualiza a cada 20s
             useEffect(() => {
-                if (!auth || auth.role !== 'admin' || activeTab !== 'settings') return;
+                if (!auth || auth.role !== 'admin' || activeTab !== 'robo') return;
                 fetchFilaRobo();
                 const id = setInterval(fetchFilaRobo, 20000);
                 return () => clearInterval(id);
@@ -7687,6 +7717,72 @@ HTML_PAGE = """
                 `;
             };
 
+            const renderRobo = () => {
+                return html`
+                    <div className="space-y-4">
+                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                            <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
+                                <i className="ph-fill ph-robot text-amber-500 text-2xl"></i> Robô de Faturamento
+                            </h2>
+                            <p className="text-sm text-slate-500 mt-1">Fila e histórico do robô que preenche o ticket e gera a OS no Omie. As chaves de acesso ficam em Templates (Global) → Faturamento.</p>
+                        </div>
+                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                            <div>
+                                <div className="flex items-center justify-between gap-2 mb-1">
+                                    <div className="font-medium text-slate-800 flex items-center gap-2"><i className="ph-bold ph-list-checks"></i> Fila do robô</div>
+                                    <div className="flex items-center gap-3">
+                                        ${filaRoboTs && html`<span className="text-xs text-slate-400 whitespace-nowrap">atualizado ${filaRoboTs}</span>`}
+                                        <button onClick=${fetchFilaRobo} disabled=${filaRoboLoading} className="text-amber-600 hover:text-amber-700 text-sm font-medium flex items-center gap-1 disabled:opacity-50">
+                                            <i className=${'ph-bold ph-arrows-clockwise' + (filaRoboLoading ? ' animate-spin' : '')}></i> ${filaRoboLoading ? 'Atualizando…' : 'Atualizar'}
+                                        </button>
+                                    </div>
+                                </div>
+                                <p className="text-xs text-slate-500 mb-3">Oportunidades aguardando o robô faturar (PV/OS) no Omie. Atualiza sozinho a cada 20s.</p>
+                                ${filaRobo === null ? html`<div className="text-sm text-slate-400"><i className="ph ph-spinner animate-spin"></i> Carregando...</div>` : html`
+                                    <div>
+                                        ${(filaRobo.pendentes || []).length === 0
+                                            ? html`<div className="text-sm text-emerald-600 flex items-center gap-1"><i className="ph-fill ph-check-circle"></i> Fila vazia — nada pendente.</div>`
+                                            : html`
+                                            <div className="text-xs text-slate-500 mb-1">${filaRobo.pendentes.length} na fila</div>
+                                            <div className="overflow-x-auto rounded border border-slate-200">
+                                                <table className="min-w-full text-sm">
+                                                    <thead className="bg-slate-100 text-slate-700"><tr><th className="p-2 text-left">Nº Op</th><th className="p-2 text-left">Cliente</th><th className="p-2 text-center">Prod.</th><th className="p-2 text-center">Serv.</th><th className="p-2 text-left">Esperando desde</th><th className="p-2 text-right">Ação</th></tr></thead>
+                                                    <tbody className="divide-y divide-slate-100">
+                                                        ${filaRobo.pendentes.map((p, i) => html`<tr key=${i} className="hover:bg-slate-50">
+                                                            <td className="p-2 font-mono text-xs whitespace-nowrap">${p.crmOpNum}</td>
+                                                            <td className="p-2 text-xs">${p.cliente || '—'}</td>
+                                                            <td className="p-2 text-center text-xs">${p.qtdProdutos}</td>
+                                                            <td className="p-2 text-center text-xs">${p.qtdServicos}</td>
+                                                            <td className="p-2 text-xs whitespace-nowrap">${(p.sentAt || '').slice(0, 16).replace('T', ' ')}</td>
+                                                            <td className="p-2 text-right"><button onClick=${() => removerDaFila(p.osId, p.crmOpNum)} className="text-red-600 hover:text-red-800 text-xs font-medium whitespace-nowrap" title="Marcar como já faturada e remover da fila"><i className="ph-bold ph-x-circle"></i> Remover</button></td>
+                                                        </tr>`)}
+                                                    </tbody>
+                                                </table>
+                                            </div>`}
+                                        ${(filaRobo.recentes || []).length > 0 && html`
+                                            <div className="mt-4">
+                                                <div className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1"><i className="ph-bold ph-check-circle"></i> Últimas faturadas pelo robô</div>
+                                                <div className="space-y-1">
+                                                    ${filaRobo.recentes.map((r, i) => html`<div key=${i} className="flex items-center justify-between gap-2 text-xs bg-slate-50 rounded px-3 py-1.5">
+                                                        <div className="min-w-0 truncate">
+                                                            <span className="font-mono text-slate-600">${r.crmOpNum}</span>
+                                                            <span className="text-slate-500 ml-2">${r.cliente || ''}</span>
+                                                        </div>
+                                                        <div className="text-slate-400 whitespace-nowrap flex items-center gap-2">
+                                                            ${r.roboPV ? html`<span className="text-emerald-600">PV ${r.roboPV}</span>` : ''}
+                                                            ${r.roboOS ? html`<span className="text-emerald-600">OS ${r.roboOS}</span>` : ''}
+                                                            <span>${(r.roboFaturadoAt || '').slice(0, 10)}</span>
+                                                        </div>
+                                                    </div>`)}
+                                                </div>
+                                            </div>`}
+                                    </div>`}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            };
+
             const renderSettings = () => {
                 if(!currentEditingModel) return null;
 
@@ -7759,57 +7855,6 @@ HTML_PAGE = """
                                     </div>`}
                             </div>
 
-                            <div className="mt-5 pt-4 border-t border-slate-100">
-                                <div className="flex items-center justify-between gap-2 mb-1">
-                                    <div className="font-medium text-slate-800 flex items-center gap-2"><i className="ph-bold ph-list-checks"></i> Fila do robô</div>
-                                    <div className="flex items-center gap-3">
-                                        ${filaRoboTs && html`<span className="text-xs text-slate-400 whitespace-nowrap">atualizado ${filaRoboTs}</span>`}
-                                        <button onClick=${fetchFilaRobo} disabled=${filaRoboLoading} className="text-amber-600 hover:text-amber-700 text-sm font-medium flex items-center gap-1 disabled:opacity-50">
-                                            <i className=${'ph-bold ph-arrows-clockwise' + (filaRoboLoading ? ' animate-spin' : '')}></i> ${filaRoboLoading ? 'Atualizando…' : 'Atualizar'}
-                                        </button>
-                                    </div>
-                                </div>
-                                <p className="text-xs text-slate-500 mb-3">Oportunidades aguardando o robô faturar (PV/OS) no Omie. Atualiza sozinho a cada 20s.</p>
-                                ${filaRobo === null ? html`<div className="text-sm text-slate-400"><i className="ph ph-spinner animate-spin"></i> Carregando...</div>` : html`
-                                    <div>
-                                        ${(filaRobo.pendentes || []).length === 0
-                                            ? html`<div className="text-sm text-emerald-600 flex items-center gap-1"><i className="ph-fill ph-check-circle"></i> Fila vazia — nada pendente.</div>`
-                                            : html`
-                                            <div className="text-xs text-slate-500 mb-1">${filaRobo.pendentes.length} na fila</div>
-                                            <div className="overflow-x-auto rounded border border-slate-200">
-                                                <table className="min-w-full text-sm">
-                                                    <thead className="bg-slate-100 text-slate-700"><tr><th className="p-2 text-left">Nº Op</th><th className="p-2 text-left">Cliente</th><th className="p-2 text-center">Prod.</th><th className="p-2 text-center">Serv.</th><th className="p-2 text-left">Esperando desde</th><th className="p-2 text-right">Ação</th></tr></thead>
-                                                    <tbody className="divide-y divide-slate-100">
-                                                        ${filaRobo.pendentes.map((p, i) => html`<tr key=${i} className="hover:bg-slate-50">
-                                                            <td className="p-2 font-mono text-xs whitespace-nowrap">${p.crmOpNum}</td>
-                                                            <td className="p-2 text-xs">${p.cliente || '—'}</td>
-                                                            <td className="p-2 text-center text-xs">${p.qtdProdutos}</td>
-                                                            <td className="p-2 text-center text-xs">${p.qtdServicos}</td>
-                                                            <td className="p-2 text-xs whitespace-nowrap">${(p.sentAt || '').slice(0, 16).replace('T', ' ')}</td>
-                                                            <td className="p-2 text-right"><button onClick=${() => removerDaFila(p.osId, p.crmOpNum)} className="text-red-600 hover:text-red-800 text-xs font-medium whitespace-nowrap" title="Marcar como já faturada e remover da fila"><i className="ph-bold ph-x-circle"></i> Remover</button></td>
-                                                        </tr>`)}
-                                                    </tbody>
-                                                </table>
-                                            </div>`}
-                                        ${(filaRobo.recentes || []).length > 0 && html`
-                                            <div className="mt-4">
-                                                <div className="text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1"><i className="ph-bold ph-check-circle"></i> Últimas faturadas pelo robô</div>
-                                                <div className="space-y-1">
-                                                    ${filaRobo.recentes.map((r, i) => html`<div key=${i} className="flex items-center justify-between gap-2 text-xs bg-slate-50 rounded px-3 py-1.5">
-                                                        <div className="min-w-0 truncate">
-                                                            <span className="font-mono text-slate-600">${r.crmOpNum}</span>
-                                                            <span className="text-slate-500 ml-2">${r.cliente || ''}</span>
-                                                        </div>
-                                                        <div className="text-slate-400 whitespace-nowrap flex items-center gap-2">
-                                                            ${r.roboPV ? html`<span className="text-emerald-600">PV ${r.roboPV}</span>` : ''}
-                                                            ${r.roboOS ? html`<span className="text-emerald-600">OS ${r.roboOS}</span>` : ''}
-                                                            <span>${(r.roboFaturadoAt || '').slice(0, 10)}</span>
-                                                        </div>
-                                                    </div>`)}
-                                                </div>
-                                            </div>`}
-                                    </div>`}
-                            </div>
                         </div>
 
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
@@ -8848,6 +8893,7 @@ HTML_PAGE = """
                                             <div className="text-xs text-slate-500 truncate">
                                                 ${e.crmOpNum ? html`<span className="font-mono">${e.crmOpNum}</span> · ` : ''}
                                                 ${e.equipamento || (o.fromLaudo && o.fromLaudo.model) || 'Equipamento'}
+                                                ${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}
                                                 ${o.omieOsNumber ? html` · OS ${o.omieOsNumber}` : ''}
                                             </div>
                                             ${reprovado && o.execMotivoReprova ? html`
@@ -8870,10 +8916,27 @@ HTML_PAGE = """
                                         <div className="border-t border-slate-200 p-4 space-y-5">
                                             ${execCarregando && html`<div className="text-xs text-slate-400 flex items-center gap-1"><i className="ph ph-spinner animate-spin"></i> carregando fotos…</div>`}
 
-                                            ${e.resumo ? html`
-                                                <div className="bg-purple-50 border border-purple-200 rounded-lg p-3">
-                                                    <div className="text-xs font-bold text-purple-700 uppercase mb-1 flex items-center gap-1"><i className="ph-fill ph-sparkle"></i> Resumo do que fazer (laudo IA)</div>
-                                                    <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">${e.resumo}</p>
+                                            ${(e.resumo || (os.services || []).length || (os.parts || []).length) ? html`
+                                                <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
+                                                    <div className="text-xs font-bold text-amber-800 uppercase mb-2 flex items-center gap-1"><i className="ph-fill ph-clipboard-text"></i> Resumo do que fazer</div>
+                                                    ${(os.services || []).length ? html`
+                                                        <div className="text-sm text-slate-800 mb-1">
+                                                            <b>Serviços:</b> ${(os.services || []).map(s => `${s.description || s.code || 'serviço'}${s.quantity > 1 ? ` (${s.quantity}x)` : ''}`).join(' · ')}
+                                                        </div>` : ''}
+                                                    ${(os.parts || []).length ? html`
+                                                        <div className="text-sm text-slate-800 mb-1">
+                                                            <b>Peças:</b> ${(os.parts || []).map(p => `${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}`).join(' · ')}
+                                                        </div>` : ''}
+                                                    ${e.resumo ? html`
+                                                        <div className="mt-2 pt-2 border-t border-amber-200">
+                                                            <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
+                                                                ${resumoAberto[o.id] || e.resumo.length <= 260 ? e.resumo : e.resumo.slice(0, 260).trim() + '…'}
+                                                            </p>
+                                                            ${e.resumo.length > 260 ? html`
+                                                                <button onClick=${() => setResumoAberto(p => ({ ...p, [o.id]: !p[o.id] }))} className="text-xs font-bold text-amber-800 hover:underline mt-1">
+                                                                    ${resumoAberto[o.id] ? 'ver menos' : 'ver laudo completo'}
+                                                                </button>` : ''}
+                                                        </div>` : ''}
                                                 </div>
                                             ` : ''}
 
@@ -9729,6 +9792,10 @@ HTML_PAGE = """
                             <button onClick=${() => setActiveTab('crm')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'crm' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-funnel"></i> Oportunidades (CRM)</button>
 
                             ${auth.role === 'admin' && html`
+                                <button onClick=${() => setActiveTab('robo')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'robo' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
+                                    <i className="ph-bold ph-robot"></i> Robô
+                                    ${(filaRobo && (filaRobo.pendentes || []).length) ? html`<span className="bg-amber-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">${filaRobo.pendentes.length}</span>` : ''}
+                                </button>
                                 <button onClick=${() => setActiveTab('relatorios')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'relatorios' ? 'bg-white text-teal-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-chart-bar"></i> Relatórios</button>
                                 <button onClick=${() => setActiveTab('settings')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'settings' ? 'bg-white text-indigo-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-gear"></i> Templates (Global)</button>
                                 <button onClick=${() => setActiveTab('users')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'users' ? 'bg-white text-emerald-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-users"></i> Usuários</button>
@@ -9742,6 +9809,7 @@ HTML_PAGE = """
                             ${activeTab === 'historico' ? renderHistorico() : ''}
                             ${activeTab === 'os' ? renderOS() : ''}
                             ${activeTab === 'crm' ? renderCRM() : ''}
+                            ${activeTab === 'robo' && auth.role === 'admin' ? renderRobo() : ''}
                             ${activeTab === 'relatorios' && auth.role === 'admin' ? renderRelatorios() : ''}
                             ${activeTab === 'settings' && auth.role === 'admin' ? renderSettings() : ''}
                             ${activeTab === 'users' && auth.role === 'admin' ? renderUsers() : ''}
