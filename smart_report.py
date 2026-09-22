@@ -15,6 +15,8 @@ from urllib.error import HTTPError, URLError
 import bcrypt
 
 app = Flask(__name__)
+# Teste de auto-deploy (2026-09-22): confirma que o webhook GitHub->Render
+# voltou a funcionar sozinho depois de reconectar a Source pra Biodronscp/smart-report.
 # Limite de upload (fotos/PDF em base64): 60 MB
 app.config['MAX_CONTENT_LENGTH'] = 60 * 1024 * 1024
 
