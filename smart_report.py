@@ -842,7 +842,7 @@ def manage_users():
         body = request.json or {}
         new_user = (body.get('username') or '').strip()
         new_pass = body.get('password') or ''
-        new_role = body.get('role', 'user')
+        new_role = body.get('role') if body.get('role') in ('user', 'almoxarife', 'admin') else 'user'
         first = (body.get('firstName') or '').strip()
         last = (body.get('lastName') or '').strip()
         email = (body.get('email') or '').strip().lower()
@@ -897,7 +897,7 @@ def approve_user(username):
     full_data['users'][username]['status'] = 'active'
     # Permite definir o papel (usuário comum / admin) já no momento da aprovação.
     new_role = body.get('role')
-    if new_role in ('user', 'admin'):
+    if new_role in ('user', 'almoxarife', 'admin'):
         full_data['users'][username]['role'] = new_role
     # Permite ajustar as filiais do usuário na aprovação (se o admin enviar).
     if body.get('filialIds') is not None:
@@ -1286,6 +1286,8 @@ def export_config():
         "laudos": _inflate_laudos_map(full_data.get('laudos', {})),  # reinfla fotos -> backup self-contained
         "userStates": full_data.get('userStates', {}),  # osDrafts (OS/serviços) por usuário
         "filiais": full_data.get('filiais', {}),  # cuidado: inclui Omie App Secret por filial
+        "requisicoes": full_data.get('requisicoes', []),  # requisições de peças ao almoxarifado
+        "reqSeq": full_data.get('reqSeq', 0),
         "exportedAt": datetime.utcnow().isoformat() + "Z"
     })
 
@@ -1307,6 +1309,9 @@ def import_config():
         full_data['userStates'] = payload['userStates']
     if 'filiais' in payload:
         full_data['filiais'] = payload['filiais']
+    if 'requisicoes' in payload:
+        full_data['requisicoes'] = payload['requisicoes']
+        full_data['reqSeq'] = payload.get('reqSeq', full_data.get('reqSeq', 0))
     save_data(full_data)
     return jsonify({"success": True})
 
@@ -1319,7 +1324,7 @@ def change_role(username):
     if username not in full_data['users']:
         return jsonify({"error": "Usuário não encontrado"}), 404
     new_role = (request.json or {}).get('role')
-    if new_role not in ('user', 'admin'):
+    if new_role not in ('user', 'almoxarife', 'admin'):
         return jsonify({"error": "Role inválido"}), 400
     if username == user and new_role != 'admin':
         return jsonify({"error": "Você não pode rebaixar a si mesmo"}), 400
@@ -2792,6 +2797,197 @@ def omie_produtos():
         })
     except OmieError as e:
         return jsonify({"error": str(e)}), e.status
+
+
+# ==========================================================
+#  REQUISIÇÃO DE PEÇAS AO ALMOXARIFADO
+#  Técnico pede peças -> almoxarife separa/entrega (ou recusa). Guardado em
+#  full_data['requisicoes'] (lista), separado por filial. Não mexe no estoque do Omie.
+# ==========================================================
+REQ_URGENCIAS = ('normal', 'urgente')
+
+
+def _req_is_almox(full_data, user):
+    """Admin e usuários com papel 'almoxarife' atendem requisições."""
+    return (full_data['users'][user].get('role') or 'user') in ('admin', 'almoxarife')
+
+
+def _req_filial(full_data, user):
+    return full_data['users'][user].get('filialId') or 'matriz'
+
+
+def _req_lista(full_data):
+    if not isinstance(full_data.get('requisicoes'), list):
+        full_data['requisicoes'] = []
+    return full_data['requisicoes']
+
+
+def _req_evento(r, user, acao, texto=''):
+    r.setdefault('historico', []).append({
+        "em": datetime.utcnow().isoformat() + "Z", "por": user, "acao": acao, "texto": texto
+    })
+    r['atualizadoEm'] = r['historico'][-1]['em']
+
+
+def _req_view(full_data, r):
+    return {**r,
+            "solicitanteNome": _responsavel_nome(full_data, r.get('solicitante')),
+            "historico": [{**h, "porNome": _responsavel_nome(full_data, h.get('por'))} for h in (r.get('historico') or [])]}
+
+
+def _req_txt(v, n):
+    return (str(v) if v is not None else '').strip()[:n]
+
+
+def _req_num(v, default=0.0):
+    try:
+        x = float(str(v).replace(',', '.'))
+        return x if x == x and x not in (float('inf'), float('-inf')) else default
+    except (TypeError, ValueError):
+        return default
+
+
+@app.route('/api/requisicoes', methods=['GET'])
+def req_listar():
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    almox = _req_is_almox(full_data, user)
+    fil = _req_filial(full_data, user)
+    out = [_req_view(full_data, r) for r in _req_lista(full_data)
+           if (r.get('filialId') or 'matriz') == fil and (almox or r.get('solicitante') == user)]
+    out.sort(key=lambda r: r.get('criadoEm') or '', reverse=True)
+    return jsonify({"items": out, "almoxarife": almox})
+
+
+@app.route('/api/requisicoes', methods=['POST'])
+def req_criar():
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    body = request.json or {}
+    itens = []
+    for it in (body.get('itens') or [])[:60]:
+        desc = _req_txt(it.get('descricao'), 200)
+        qtd = _req_num(it.get('qtd'))
+        if not desc:
+            continue
+        if qtd <= 0:
+            return jsonify({"error": f"Quantidade inválida em: {desc}"}), 400
+        itens.append({
+            "codigo": _req_txt(it.get('codigo'), 60),
+            "descricao": desc,
+            "qtd": qtd,
+            "unidade": _req_txt(it.get('unidade'), 8) or 'UN',
+            "obs": _req_txt(it.get('obs'), 200),
+            "qtdAtendida": None,
+        })
+    if not itens:
+        return jsonify({"error": "Adicione ao menos uma peça"}), 400
+    urg = body.get('urgencia') if body.get('urgencia') in REQ_URGENCIAS else 'normal'
+    full_data['reqSeq'] = int(full_data.get('reqSeq') or 0) + 1
+    now = datetime.utcnow().isoformat() + "Z"
+    r = {
+        "id": "req_" + str(int(datetime.utcnow().timestamp() * 1000)) + "_" + secrets.token_hex(3),
+        "numero": f"REQ-{full_data['reqSeq']:04d}",
+        "filialId": _req_filial(full_data, user),
+        "solicitante": user,
+        "criadoEm": now,
+        "atualizadoEm": now,
+        "status": "pendente",
+        "urgencia": urg,
+        "osId": _req_txt(body.get('osId'), 80),
+        "osRotulo": _req_txt(body.get('osRotulo'), 160),
+        "observacao": _req_txt(body.get('observacao'), 500),
+        "itens": itens,
+        "resposta": "",
+        "retiradoPor": "",
+        "historico": [],
+    }
+    _req_evento(r, user, 'criada')
+    _req_lista(full_data).append(r)
+    save_data(full_data)
+    return jsonify(_req_view(full_data, r))
+
+
+@app.route('/api/requisicoes/<req_id>/acao', methods=['POST'])
+def req_acao(req_id):
+    """acao: separar | entregar | recusar (almoxarife) · cancelar (dono ou almoxarife) · reabrir (almoxarife)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    body = request.json or {}
+    acao = body.get('acao')
+    fil = _req_filial(full_data, user)
+    almox = _req_is_almox(full_data, user)
+    r = next((x for x in _req_lista(full_data) if x.get('id') == req_id and (x.get('filialId') or 'matriz') == fil), None)
+    if not r or not (almox or r.get('solicitante') == user):
+        return jsonify({"error": "Requisição não encontrada"}), 404
+    st = r.get('status')
+    aberta = st in ('pendente', 'em_separacao')
+
+    if acao == 'cancelar':
+        if not aberta or not (almox or (r.get('solicitante') == user and st == 'pendente')):
+            return jsonify({"error": "Só é possível cancelar enquanto estiver pendente"}), 400
+        r['status'] = 'cancelada'
+        _req_evento(r, user, 'cancelada', _req_txt(body.get('texto'), 200))
+    elif not almox:
+        return jsonify({"error": "Apenas o almoxarifado pode fazer isso"}), 403
+    elif acao == 'separar':
+        if st != 'pendente':
+            return jsonify({"error": "Requisição não está pendente"}), 400
+        r['status'] = 'em_separacao'
+        _req_evento(r, user, 'em_separacao')
+    elif acao == 'entregar':
+        if not aberta:
+            return jsonify({"error": "Requisição já encerrada"}), 400
+        qtds = body.get('qtds') if isinstance(body.get('qtds'), list) else []
+        for i, it in enumerate(r['itens']):
+            q = _req_num(qtds[i], it['qtd']) if i < len(qtds) and qtds[i] not in (None, '') else it['qtd']
+            it['qtdAtendida'] = max(0.0, min(q, it['qtd']))
+        if all((it['qtdAtendida'] or 0) <= 0 for it in r['itens']):
+            return jsonify({"error": "Nenhum item entregue — use Recusar"}), 400
+        r['status'] = 'entregue'
+        r['retiradoPor'] = _req_txt(body.get('retiradoPor'), 80)
+        r['resposta'] = _req_txt(body.get('resposta'), 300)
+        parcial = any(it['qtdAtendida'] < it['qtd'] for it in r['itens'])
+        _req_evento(r, user, 'entregue_parcial' if parcial else 'entregue', r['resposta'])
+    elif acao == 'recusar':
+        if not aberta:
+            return jsonify({"error": "Requisição já encerrada"}), 400
+        motivo = _req_txt(body.get('texto'), 300)
+        if not motivo:
+            return jsonify({"error": "Informe o motivo da recusa"}), 400
+        r['status'] = 'recusada'
+        r['resposta'] = motivo
+        _req_evento(r, user, 'recusada', motivo)
+    elif acao == 'reabrir':
+        if aberta:
+            return jsonify({"error": "Requisição já está aberta"}), 400
+        r['status'] = 'pendente'
+        for it in r['itens']:
+            it['qtdAtendida'] = None
+        r['resposta'] = ''
+        r['retiradoPor'] = ''
+        _req_evento(r, user, 'reaberta')
+    else:
+        return jsonify({"error": "Ação inválida"}), 400
+    save_data(full_data)
+    return jsonify(_req_view(full_data, r))
+
+
+@app.route('/api/requisicoes/<req_id>', methods=['DELETE'])
+def req_excluir(req_id):
+    user, full_data, err = _require_admin()
+    if err:
+        return err
+    lista = _req_lista(full_data)
+    novo = [x for x in lista if x.get('id') != req_id]
+    if len(novo) == len(lista):
+        return jsonify({"error": "Requisição não encontrada"}), 404
+    full_data['requisicoes'] = novo
+    save_data(full_data)
+    return jsonify({"success": True})
 
 
 # ==========================================================
@@ -5296,6 +5492,16 @@ HTML_PAGE = """
             const [testesChecklist, setTestesChecklist] = useState([]);   // itens do teste (global, admin edita)
             const [roboTokens, setRoboTokens] = useState([]);
             const [filaRobo, setFilaRobo] = useState(null);   // {pendentes, recentes} — painel da fila do robô
+            // Requisições de peças ao almoxarifado
+            const [requisicoes, setRequisicoes] = useState(null);   // null = ainda não carregou
+            const [reqAlmox, setReqAlmox] = useState(false);        // este usuário atende requisições?
+            const [reqLoading, setReqLoading] = useState(false);
+            const [reqFiltro, setReqFiltro] = useState('abertas');  // abertas | concluidas | todas
+            const [reqTexto, setReqTexto] = useState('');
+            const [reqForm, setReqForm] = useState(null);           // null = formulário fechado
+            const [reqBusca, setReqBusca] = useState({ idx: null, q: '', results: [], msg: '' });
+            const [reqSaving, setReqSaving] = useState(false);
+            const [reqEntrega, setReqEntrega] = useState(null);     // {id, qtds:[], retiradoPor, resposta}
             const [filaRoboTs, setFilaRoboTs] = useState(null);      // horário da última atualização (feedback)
             const [filaRoboLoading, setFilaRoboLoading] = useState(false);
 
@@ -5610,6 +5816,112 @@ HTML_PAGE = """
                     fetchOsDrafts(); // pra marcar quais oportunidades já viraram OS
                 }
             }, [activeTab, auth]);
+
+            // Requisições de peças: carrega ao logar (pro selo da aba) e atualiza sozinho
+            // (20s com a aba aberta, 90s em segundo plano).
+            useEffect(() => {
+                if (!auth) return;
+                fetchRequisicoes();
+                if (activeTab === 'requisicoes' && (!osDrafts || osDrafts.length === 0)) fetchOsDrafts();
+                const id = setInterval(fetchRequisicoes, activeTab === 'requisicoes' ? 20000 : 90000);
+                return () => clearInterval(id);
+            }, [activeTab, auth]);
+            // Autocomplete de peças (catálogo Omie) no formulário de requisição
+            useEffect(() => {
+                if (reqBusca.idx === null || reqBusca.idx === undefined) return;
+                const q = (reqBusca.q || '').trim();
+                if (q.length < 2) return;
+                const t = setTimeout(() => {
+                    fetch(`/api/omie/produtos?q=${encodeURIComponent(q)}`, { headers: { 'Authorization': auth.token } })
+                        .then(r => r.json()).then(d => {
+                            const items = d.items || [];
+                            const msg = d.error ? ('Erro: ' + d.error) : (items.length ? '' : 'Nada no catálogo — pode enviar como texto livre.');
+                            setReqBusca(b => (b.q === reqBusca.q && b.idx === reqBusca.idx) ? { ...b, results: items, msg } : b);
+                        }).catch(() => {});
+                }, 400);
+                return () => clearTimeout(t);
+            }, [reqBusca.q, reqBusca.idx]);
+
+            const fetchRequisicoes = () => {
+                if (!auth) return;
+                setReqLoading(true);
+                fetch('/api/requisicoes', { headers: { 'Authorization': auth.token } })
+                    .then(r => r.json())
+                    .then(d => { if (d && Array.isArray(d.items)) { setRequisicoes(d.items); setReqAlmox(!!d.almoxarife); } })
+                    .catch(() => {})
+                    .finally(() => setReqLoading(false));
+            };
+            const reqItemVazio = () => ({ codigo: '', descricao: '', qtd: 1, unidade: 'UN', obs: '' });
+            const reqNovo = () => setReqForm({ osId: '', osRotulo: '', urgencia: 'normal', observacao: '', itens: [reqItemVazio()] });
+            const reqSetItem = (i, patch) => setReqForm(f => ({ ...f, itens: f.itens.map((it, k) => k === i ? { ...it, ...patch } : it) }));
+            const reqAddItem = () => setReqForm(f => ({ ...f, itens: [...f.itens, reqItemVazio()] }));
+            const reqDelItem = (i) => setReqForm(f => ({ ...f, itens: f.itens.length > 1 ? f.itens.filter((_, k) => k !== i) : f.itens }));
+            const reqEnviar = async () => {
+                const itens = reqForm.itens.filter(it => (it.descricao || '').trim());
+                if (!itens.length) { alert('Adicione ao menos uma peça.'); return; }
+                if (itens.some(it => !(Number(String(it.qtd).replace(',', '.')) > 0))) { alert('Informe a quantidade de cada peça.'); return; }
+                setReqSaving(true);
+                try {
+                    const r = await fetch('/api/requisicoes', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ ...reqForm, itens })
+                    });
+                    const d = await r.json();
+                    if (!r.ok) { alert(d.error || 'Erro ao enviar a requisição'); return; }
+                    setReqForm(null);
+                    setReqBusca({ idx: null, q: '', results: [], msg: '' });
+                    setReqFiltro('abertas');
+                    fetchRequisicoes();
+                } catch (e) { alert('Erro de conexão'); }
+                finally { setReqSaving(false); }
+            };
+            const reqAcao = async (r, acao, extra = {}) => {
+                try {
+                    const resp = await fetch('/api/requisicoes/' + r.id + '/acao', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ acao, ...extra })
+                    });
+                    const d = await resp.json();
+                    if (!resp.ok) { alert(d.error || 'Erro'); return false; }
+                    fetchRequisicoes();
+                    return true;
+                } catch (e) { alert('Erro de conexão'); return false; }
+            };
+            const reqRecusar = (r) => {
+                const motivo = prompt('Motivo da recusa (o solicitante vai ver):');
+                if (motivo && motivo.trim()) reqAcao(r, 'recusar', { texto: motivo.trim() });
+            };
+            const reqCancelar = (r) => { if (confirm('Cancelar a requisição ' + r.numero + '?')) reqAcao(r, 'cancelar'); };
+            const reqExcluir = async (r) => {
+                if (!confirm('EXCLUIR de vez a requisição ' + r.numero + '? Não tem como desfazer.')) return;
+                await fetch('/api/requisicoes/' + r.id, { method: 'DELETE', headers: { 'Authorization': auth.token } });
+                fetchRequisicoes();
+            };
+            const reqConfirmarEntrega = async () => {
+                const r = requisicoes.find(x => x.id === reqEntrega.id);
+                if (!r) return;
+                const ok = await reqAcao(r, 'entregar', { qtds: reqEntrega.qtds, retiradoPor: reqEntrega.retiradoPor, resposta: reqEntrega.resposta });
+                if (ok) setReqEntrega(null);
+            };
+            const reqData = (iso) => { try { return new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } };
+            const reqFmtQtd = (n) => (n === null || n === undefined) ? '' : String(Math.round(n * 1000) / 1000).replace('.', ',');
+            const reqImprimir = (r) => {
+                const esc = (t) => String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const linhas = r.itens.map(it => '<tr><td>' + esc(it.codigo) + '</td><td>' + esc(it.descricao) + (it.obs ? '<br><small>' + esc(it.obs) + '</small>' : '') + '</td><td style="text-align:center">' + reqFmtQtd(it.qtd) + ' ' + esc(it.unidade) + '</td><td style="text-align:center">' + (it.qtdAtendida === null || it.qtdAtendida === undefined ? '' : reqFmtQtd(it.qtdAtendida)) + '</td></tr>').join('');
+                const w = window.open('', '_blank');
+                if (!w) { alert('Libere pop-ups para imprimir.'); return; }
+                w.document.write('<html><head><meta charset="utf-8"><title>' + esc(r.numero) + '</title><style>body{font-family:Arial,sans-serif;font-size:13px;margin:24px}h1{font-size:20px;margin:0 0 4px}table{border-collapse:collapse;width:100%;margin-top:12px}th,td{border:1px solid #444;padding:6px;text-align:left}th{background:#eee}.ass{display:flex;gap:40px;margin-top:60px}.ass div{flex:1;border-top:1px solid #000;text-align:center;padding-top:4px}</style></head><body>' +
+                    '<h1>Requisição de Peças ' + esc(r.numero) + (r.urgencia === 'urgente' ? ' — URGENTE' : '') + '</h1>' +
+                    '<div>Solicitante: <b>' + esc(r.solicitanteNome) + '</b> &nbsp; Data: ' + esc(reqData(r.criadoEm)) + '</div>' +
+                    '<div>OS / destino: <b>' + esc(r.osRotulo || 'Sem OS (uso interno)') + '</b></div>' +
+                    (r.observacao ? '<div>Obs.: ' + esc(r.observacao) + '</div>' : '') +
+                    '<table><thead><tr><th>Código</th><th>Peça</th><th>Qtd. pedida</th><th>Qtd. entregue</th></tr></thead><tbody>' + linhas + '</tbody></table>' +
+                    '<div class="ass"><div>Almoxarifado</div><div>Recebido por</div></div></body></html>');
+                w.document.close();
+                setTimeout(() => w.print(), 300);
+            };
 
             // Painel "Fila do robô" (aba Robô, admin): busca ao entrar e atualiza a cada 20s
             useEffect(() => {
@@ -7719,6 +8031,192 @@ HTML_PAGE = """
                 `;
             };
 
+            const renderRequisicoes = () => {
+                const ST = {
+                    pendente:     { t: 'Pendente',      c: 'bg-amber-100 text-amber-800 border-amber-300' },
+                    em_separacao: { t: 'Em separação',  c: 'bg-blue-100 text-blue-800 border-blue-300' },
+                    entregue:     { t: 'Entregue',      c: 'bg-emerald-100 text-emerald-800 border-emerald-300' },
+                    recusada:     { t: 'Recusada',      c: 'bg-red-100 text-red-800 border-red-300' },
+                    cancelada:    { t: 'Cancelada',     c: 'bg-slate-200 text-slate-600 border-slate-300' }
+                };
+                const ACAO_TXT = { criada: 'criou', em_separacao: 'iniciou a separação', entregue: 'entregou', entregue_parcial: 'entregou parcialmente', recusada: 'recusou', cancelada: 'cancelou', reaberta: 'reabriu' };
+                const todas = requisicoes || [];
+                const abertaSt = (r) => r.status === 'pendente' || r.status === 'em_separacao';
+                const qtdAbertas = todas.filter(abertaSt).length;
+                const qtdConcl = todas.length - qtdAbertas;
+                const termo = (reqTexto || '').trim().toLowerCase();
+                let lista = todas.filter(r => reqFiltro === 'todas' ? true : (reqFiltro === 'abertas' ? abertaSt(r) : !abertaSt(r)));
+                if (termo) {
+                    lista = lista.filter(r => (r.numero + ' ' + (r.solicitanteNome || '') + ' ' + (r.osRotulo || '') + ' ' + r.itens.map(i => i.codigo + ' ' + i.descricao).join(' ')).toLowerCase().includes(termo));
+                }
+                // Abertas: urgentes primeiro e depois as mais antigas (fila FIFO). Demais: mais recentes primeiro.
+                if (reqFiltro === 'abertas') {
+                    lista = [...lista].sort((a, b) => ((b.urgencia === 'urgente') - (a.urgencia === 'urgente')) || String(a.criadoEm).localeCompare(String(b.criadoEm)));
+                }
+                const osOpcoes = (osDrafts || []).slice(0, 80).map(o => {
+                    const ref = o.omieOsNumber ? ('OS ' + o.omieOsNumber) : (o.crmOpNum ? ('Op ' + o.crmOpNum) : 'Rascunho');
+                    return { id: o.id, rotulo: ref + ' — ' + ((o.client && o.client.name) || 'sem cliente') };
+                });
+
+                const renderForm = () => html`
+                    <div className="bg-white p-5 rounded-xl shadow-sm border-2 border-orange-300 space-y-4">
+                        <div className="flex items-center justify-between">
+                            <h3 className="font-semibold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-package text-orange-500 text-xl"></i> Nova requisição de peças</h3>
+                            <button onClick=${() => { setReqForm(null); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }} className="text-slate-400 hover:text-slate-600"><i className="ph-bold ph-x"></i></button>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <label className="md:col-span-2 text-xs font-medium text-slate-600">Para qual OS / oportunidade?
+                                <select value=${reqForm.osId} onChange=${e => { const o = osOpcoes.find(x => x.id === e.target.value); setReqForm({ ...reqForm, osId: e.target.value, osRotulo: o ? o.rotulo : '' }); }} className="mt-1 w-full p-2 border border-slate-300 rounded text-sm bg-white">
+                                    <option value="">Sem OS (uso interno / reposição)</option>
+                                    ${osOpcoes.map(o => html`<option key=${o.id} value=${o.id}>${o.rotulo}</option>`)}
+                                </select>
+                            </label>
+                            <label className="text-xs font-medium text-slate-600">Urgência
+                                <select value=${reqForm.urgencia} onChange=${e => setReqForm({ ...reqForm, urgencia: e.target.value })} className=${`mt-1 w-full p-2 border rounded text-sm bg-white ${reqForm.urgencia === 'urgente' ? 'border-red-400 text-red-700 font-bold' : 'border-slate-300'}`}>
+                                    <option value="normal">Normal</option>
+                                    <option value="urgente">Urgente</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div className="space-y-2">
+                            <div className="text-xs font-semibold text-slate-600">Peças</div>
+                            ${reqForm.itens.map((it, i) => html`
+                                <div key=${i} className="grid grid-cols-12 gap-2 items-start bg-slate-50 border border-slate-200 rounded-lg p-2">
+                                    <div className="col-span-12 md:col-span-7 relative">
+                                        <input value=${it.descricao} placeholder="Digite o nome ou código da peça (busca no catálogo Omie)"
+                                            onInput=${e => { const v = e.target.value; reqSetItem(i, { descricao: v, codigo: '' }); setReqBusca({ idx: i, q: v, results: [], msg: '' }); }}
+                                            className="w-full p-2 border border-slate-300 rounded text-sm bg-white outline-none focus:ring-2 focus:ring-orange-400" />
+                                        ${it.codigo && html`<div className="text-[11px] text-emerald-700 mt-0.5"><i className="ph-fill ph-check-circle"></i> Código ${it.codigo}</div>`}
+                                        ${reqBusca.idx === i && (reqBusca.results.length > 0 || reqBusca.msg) && html`
+                                            <div className="absolute z-20 left-0 right-0 mt-1 bg-white border border-slate-300 rounded-lg shadow-lg max-h-56 overflow-auto">
+                                                ${reqBusca.msg && html`<div className="p-2 text-xs text-slate-500">${reqBusca.msg}</div>`}
+                                                ${reqBusca.results.map((p, k) => html`
+                                                    <button key=${k} type="button" onClick=${() => { reqSetItem(i, { codigo: p.code || '', descricao: p.description || '', unidade: p.unit || it.unidade }); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }}
+                                                        className="w-full text-left px-3 py-2 text-sm hover:bg-orange-50 border-b border-slate-100 last:border-0">
+                                                        <span className="font-mono text-xs text-slate-500">${p.code}</span> ${p.description}
+                                                    </button>`)}
+                                            </div>`}
+                                    </div>
+                                    <div className="col-span-4 md:col-span-2"><input type="text" inputMode="decimal" value=${it.qtd} onInput=${e => reqSetItem(i, { qtd: e.target.value })} placeholder="Qtd" className="w-full p-2 border border-slate-300 rounded text-sm bg-white text-center" /></div>
+                                    <div className="col-span-6 md:col-span-2"><input value=${it.obs} onInput=${e => reqSetItem(i, { obs: e.target.value })} placeholder="Obs." className="w-full p-2 border border-slate-300 rounded text-sm bg-white" /></div>
+                                    <div className="col-span-2 md:col-span-1 text-right"><button onClick=${() => reqDelItem(i)} disabled=${reqForm.itens.length <= 1} className="p-2 text-red-500 hover:text-red-700 disabled:opacity-30" title="Remover peça"><i className="ph-bold ph-trash"></i></button></div>
+                                </div>`)}
+                            <button onClick=${reqAddItem} className="text-orange-600 hover:text-orange-700 text-sm font-medium flex items-center gap-1"><i className="ph-bold ph-plus-circle"></i> Adicionar outra peça</button>
+                        </div>
+                        <label className="block text-xs font-medium text-slate-600">Observações (opcional)
+                            <textarea value=${reqForm.observacao} onInput=${e => setReqForm({ ...reqForm, observacao: e.target.value })} rows="2" className="mt-1 w-full p-2 border border-slate-300 rounded text-sm bg-white" placeholder="Ex.: preciso até o fim do dia, pode ser similar…"></textarea>
+                        </label>
+                        <div className="flex justify-end gap-2">
+                            <button onClick=${() => { setReqForm(null); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }} className="px-4 py-2 rounded-lg text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+                            <button onClick=${reqEnviar} disabled=${reqSaving} className="px-5 py-2 rounded-lg text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 disabled:opacity-50 flex items-center gap-2"><i className="ph-bold ph-paper-plane-tilt"></i> ${reqSaving ? 'Enviando…' : 'Enviar ao almoxarifado'}</button>
+                        </div>
+                    </div>`;
+
+                const renderCard = (r) => {
+                    const st = ST[r.status] || ST.pendente;
+                    const meu = r.solicitante === auth.username;
+                    const emEntrega = reqEntrega && reqEntrega.id === r.id;
+                    const aberta = abertaSt(r);
+                    return html`
+                        <div key=${r.id} className=${`bg-white rounded-xl shadow-sm border p-4 ${r.urgencia === 'urgente' && aberta ? 'border-red-300' : 'border-slate-200'}`}>
+                            <div className="flex flex-wrap items-center gap-2 justify-between">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-mono font-bold text-slate-800">${r.numero}</span>
+                                    <span className=${`text-xs font-bold px-2 py-0.5 rounded-full border ${st.c}`}>${st.t}</span>
+                                    ${r.urgencia === 'urgente' && html`<span className="text-xs font-bold px-2 py-0.5 rounded-full bg-red-500 text-white"><i className="ph-fill ph-warning"></i> URGENTE</span>`}
+                                </div>
+                                <div className="text-xs text-slate-500">${r.solicitanteNome}${meu ? ' (você)' : ''} · ${reqData(r.criadoEm)}</div>
+                            </div>
+                            <div className="text-xs text-slate-600 mt-1"><i className="ph-bold ph-clipboard-text"></i> ${r.osRotulo || 'Sem OS (uso interno)'}</div>
+                            <div className="mt-2 divide-y divide-slate-100 border border-slate-100 rounded-lg">
+                                ${r.itens.map((it, k) => html`
+                                    <div key=${k} className="flex items-center justify-between gap-3 px-3 py-1.5 text-sm">
+                                        <div className="min-w-0">
+                                            <span className="font-mono text-xs text-slate-400">${it.codigo}</span> ${it.descricao}
+                                            ${it.obs && html`<div className="text-xs text-slate-500">${it.obs}</div>`}
+                                        </div>
+                                        <div className="whitespace-nowrap text-right font-medium">
+                                            ${it.qtdAtendida !== null && it.qtdAtendida !== undefined
+                                                ? html`<span className=${it.qtdAtendida < it.qtd ? 'text-amber-600' : 'text-emerald-600'}>${reqFmtQtd(it.qtdAtendida)}/${reqFmtQtd(it.qtd)} ${it.unidade}</span>`
+                                                : html`<span>${reqFmtQtd(it.qtd)} ${it.unidade}</span>`}
+                                        </div>
+                                    </div>`)}
+                            </div>
+                            ${r.observacao && html`<div className="text-xs text-slate-600 mt-2"><b>Obs.:</b> ${r.observacao}</div>`}
+                            ${r.resposta && html`<div className=${`text-xs mt-2 px-3 py-2 rounded ${r.status === 'recusada' ? 'bg-red-50 text-red-700' : 'bg-slate-50 text-slate-600'}`}><b>Almoxarifado:</b> ${r.resposta}</div>`}
+                            ${r.retiradoPor && html`<div className="text-xs text-slate-500 mt-1">Retirado por: ${r.retiradoPor}</div>`}
+
+                            ${emEntrega && html`
+                                <div className="mt-3 p-3 bg-emerald-50 border border-emerald-200 rounded-lg space-y-2">
+                                    <div className="text-xs font-semibold text-emerald-800">Quantidade entregue de cada peça (reduza se for entrega parcial):</div>
+                                    ${r.itens.map((it, k) => html`
+                                        <div key=${k} className="flex items-center gap-2 text-sm">
+                                            <input type="text" inputMode="decimal" value=${reqEntrega.qtds[k]} onInput=${e => { const q = [...reqEntrega.qtds]; q[k] = e.target.value; setReqEntrega({ ...reqEntrega, qtds: q }); }} className="w-20 p-1.5 border border-slate-300 rounded text-center bg-white" />
+                                            <span className="text-xs text-slate-500">de ${reqFmtQtd(it.qtd)} ${it.unidade}</span>
+                                            <span className="truncate">${it.descricao}</span>
+                                        </div>`)}
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        <input value=${reqEntrega.retiradoPor} onInput=${e => setReqEntrega({ ...reqEntrega, retiradoPor: e.target.value })} placeholder="Quem retirou (opcional)" className="p-2 border border-slate-300 rounded text-sm bg-white" />
+                                        <input value=${reqEntrega.resposta} onInput=${e => setReqEntrega({ ...reqEntrega, resposta: e.target.value })} placeholder="Recado ao solicitante (opcional)" className="p-2 border border-slate-300 rounded text-sm bg-white" />
+                                    </div>
+                                    <div className="flex justify-end gap-2">
+                                        <button onClick=${() => setReqEntrega(null)} className="px-3 py-1.5 text-sm text-slate-600 hover:bg-white rounded">Voltar</button>
+                                        <button onClick=${reqConfirmarEntrega} className="px-4 py-1.5 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded flex items-center gap-1"><i className="ph-bold ph-check"></i> Confirmar entrega</button>
+                                    </div>
+                                </div>`}
+
+                            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                                <div className="text-[11px] text-slate-400">
+                                    ${(r.historico || []).slice(-1).map((h, k) => html`<span key=${k}>${h.porNome} ${ACAO_TXT[h.acao] || h.acao} · ${reqData(h.em)}</span>`)}
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    <button onClick=${() => reqImprimir(r)} className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded flex items-center gap-1"><i className="ph-bold ph-printer"></i> Imprimir</button>
+                                    ${reqAlmox && r.status === 'pendente' && html`<button onClick=${() => reqAcao(r, 'separar')} className="px-3 py-1.5 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded flex items-center gap-1"><i className="ph-bold ph-hand-grabbing"></i> Iniciar separação</button>`}
+                                    ${reqAlmox && aberta && !emEntrega && html`<button onClick=${() => setReqEntrega({ id: r.id, qtds: r.itens.map(it => String(it.qtd)), retiradoPor: '', resposta: '' })} className="px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded flex items-center gap-1"><i className="ph-bold ph-package"></i> Entregar</button>`}
+                                    ${reqAlmox && aberta && html`<button onClick=${() => reqRecusar(r)} className="px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded">Recusar</button>`}
+                                    ${aberta && (reqAlmox || (meu && r.status === 'pendente')) && html`<button onClick=${() => reqCancelar(r)} className="px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 rounded">Cancelar</button>`}
+                                    ${reqAlmox && !aberta && html`<button onClick=${() => reqAcao(r, 'reabrir')} className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 rounded">Reabrir</button>`}
+                                    ${auth.role === 'admin' && html`<button onClick=${() => reqExcluir(r)} className="px-2 py-1.5 text-xs text-red-400 hover:text-red-600" title="Excluir definitivamente (admin)"><i className="ph-bold ph-trash"></i></button>`}
+                                </div>
+                            </div>
+                        </div>`;
+                };
+
+                const chip = (id, label, n) => html`<button onClick=${() => setReqFiltro(id)} className=${`px-3 py-1.5 rounded-lg text-sm font-medium ${reqFiltro === id ? 'bg-orange-500 text-white shadow' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}>${label} <span className="opacity-70">(${n})</span></button>`;
+
+                return html`
+                    <div className="space-y-4">
+                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div>
+                                    <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-package text-orange-500 text-2xl"></i> Requisição de Peças</h2>
+                                    <p className="text-sm text-slate-500 mt-1">${reqAlmox ? 'Fila do almoxarifado: separe, entregue ou recuse os pedidos da equipe.' : 'Peça peças ao almoxarifado e acompanhe o andamento aqui.'}</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <button onClick=${fetchRequisicoes} disabled=${reqLoading} className="text-slate-500 hover:text-slate-700 text-sm flex items-center gap-1 disabled:opacity-50"><i className=${'ph-bold ph-arrows-clockwise' + (reqLoading ? ' animate-spin' : '')}></i></button>
+                                    ${!reqForm && html`<button onClick=${reqNovo} className="px-4 py-2 rounded-lg text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 flex items-center gap-2 shadow"><i className="ph-bold ph-plus"></i> Nova requisição</button>`}
+                                </div>
+                            </div>
+                        </div>
+
+                        ${reqForm && renderForm()}
+
+                        <div className="flex flex-wrap items-center gap-2">
+                            ${chip('abertas', 'Em aberto', qtdAbertas)}
+                            ${chip('concluidas', 'Encerradas', qtdConcl)}
+                            ${chip('todas', 'Todas', todas.length)}
+                            <input value=${reqTexto} onInput=${e => setReqTexto(e.target.value)} placeholder="Buscar nº, peça, solicitante, OS…" className="ml-auto w-full md:w-64 p-2 border border-slate-300 rounded-lg text-sm bg-white" />
+                        </div>
+
+                        ${requisicoes === null
+                            ? html`<div className="text-sm text-slate-400 p-4"><i className="ph ph-spinner animate-spin"></i> Carregando...</div>`
+                            : (lista.length === 0
+                                ? html`<div className="bg-white rounded-xl border border-dashed border-slate-300 p-8 text-center text-slate-400 text-sm">${reqFiltro === 'abertas' ? 'Nenhuma requisição em aberto.' : 'Nada por aqui.'}</div>`
+                                : html`<div className="space-y-3">${lista.map(renderCard)}</div>`)}
+                    </div>
+                `;
+            };
+
             const renderRobo = () => {
                 return html`
                     <div className="space-y-4">
@@ -8168,7 +8666,9 @@ HTML_PAGE = """
                 const trocarRoleUsuario = (u, novoRole) => {
                     if (novoRole === u.role) return;
                     const nome = (u.firstName ? `${u.firstName} ${u.lastName || ''}`.trim() : u.username);
-                    const aviso = novoRole === 'admin'
+                    const aviso = novoRole === 'almoxarife'
+                        ? `Tornar ${nome} ALMOXARIFE?\\n\\nEle passa a ver e atender TODAS as requisições de peças da filial (separar, entregar, recusar). Continua sem acesso a Templates, Usuários e valores.`
+                        : novoRole === 'admin'
                         ? `Tornar ${nome} ADMIN?\\n\\nAdmin vê valores e totais, edita Templates/Modelos, gerencia usuários e configurações do sistema.`
                         : `Tornar ${nome} usuário PADRÃO?\\n\\nEle perde o acesso a Templates, Usuários, Relatórios e deixa de ver os valores.`;
                     if (!confirm(aviso)) { fetchUsers(); return; }   // refetch: devolve o select ao valor real
@@ -8239,6 +8739,7 @@ HTML_PAGE = """
                                                 <div className="flex gap-2 items-center flex-wrap md:justify-end">
                                                     <select value=${approveRole[u.username] || 'user'} onChange=${e => setApproveRole({ ...approveRole, [u.username]: e.target.value })} className="p-2 border border-slate-300 rounded text-sm bg-white" title="Papel ao aprovar">
                                                         <option value="user">Usuário comum</option>
+                                                        <option value="almoxarife">Almoxarife</option>
                                                         <option value="admin">Administrador</option>
                                                     </select>
                                                     <button onClick=${() => callUserAction(u.username, 'approve', { body: { role: approveRole[u.username] || 'user', filialIds: approveFiliais[u.username] || u.filialIds || ['matriz'] } })} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium text-sm flex items-center gap-1"><i className="ph-bold ph-check"></i> Aprovar</button>
@@ -8264,6 +8765,7 @@ HTML_PAGE = """
                                 <input name="newPass" required type="text" minLength="6" placeholder="Senha (min. 6 caracteres)" className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none" />
                                 <select name="newRole" className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none bg-white">
                                     <option value="user">Usuário Padrão</option>
+                                    <option value="almoxarife">Almoxarife</option>
                                     <option value="admin">Administrador</option>
                                 </select>
                                 <div className="md:col-span-2 border border-slate-200 rounded p-2">
@@ -8315,8 +8817,9 @@ HTML_PAGE = """
                                                                 disabled=${euMesmo}
                                                                 title=${euMesmo ? 'Você não pode alterar o seu próprio nível de acesso' : 'Alterar nível de acesso'}
                                                                 onChange=${e => trocarRoleUsuario(u, e.target.value)}
-                                                                className=${`px-2 py-1 rounded text-xs font-bold border outline-none ${euMesmo ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'} ${u.role === 'admin' ? 'bg-indigo-100 text-indigo-700 border-indigo-300' : 'bg-slate-200 text-slate-700 border-slate-300'}`}>
+                                                                className=${`px-2 py-1 rounded text-xs font-bold border outline-none ${euMesmo ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'} ${u.role === 'admin' ? 'bg-indigo-100 text-indigo-700 border-indigo-300' : (u.role === 'almoxarife' ? 'bg-orange-100 text-orange-700 border-orange-300' : 'bg-slate-200 text-slate-700 border-slate-300')}`}>
                                                                 <option value="user">USER</option>
+                                                                <option value="almoxarife">ALMOXARIFE</option>
                                                                 <option value="admin">ADMIN</option>
                                                             </select>`;
                                                     })()}
@@ -9793,6 +10296,11 @@ HTML_PAGE = """
                             <button onClick=${() => { setActiveTab('os'); setCurrentOs(null); }} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'os' ? 'bg-white text-indigo-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clipboard-text"></i> Ordens de Serviço</button>
                             <button onClick=${() => setActiveTab('crm')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'crm' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-funnel"></i> Oportunidades (CRM)</button>
 
+                            <button onClick=${() => setActiveTab('requisicoes')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'requisicoes' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
+                                <i className="ph-bold ph-package"></i> Requisições
+                                ${(() => { const n = (requisicoes || []).filter(r => r.status === 'pendente').length; return (reqAlmox && n) ? html`<span className="bg-orange-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">${n}</span>` : ''; })()}
+                            </button>
+
                             ${auth.role === 'admin' && html`
                                 <button onClick=${() => setActiveTab('robo')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'robo' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
                                     <i className="ph-bold ph-robot"></i> Robô
@@ -9811,6 +10319,7 @@ HTML_PAGE = """
                             ${activeTab === 'historico' ? renderHistorico() : ''}
                             ${activeTab === 'os' ? renderOS() : ''}
                             ${activeTab === 'crm' ? renderCRM() : ''}
+                            ${activeTab === 'requisicoes' ? renderRequisicoes() : ''}
                             ${activeTab === 'robo' && auth.role === 'admin' ? renderRobo() : ''}
                             ${activeTab === 'relatorios' && auth.role === 'admin' ? renderRelatorios() : ''}
                             ${activeTab === 'settings' && auth.role === 'admin' ? renderSettings() : ''}
