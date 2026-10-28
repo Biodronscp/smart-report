@@ -3295,6 +3295,49 @@ def os_bancada():
     return jsonify({"items": saida, "total": len(saida)})
 
 
+@app.route('/api/os/teste', methods=['GET'])
+def os_teste():
+    """Aba 'Teste e Liberação', guiada pelo PAINEL: cartões em 'Teste de Equipamento'. Cada um aponta a OS pelo
+    número; se a OS já está no Smart vem junto (com checklist/observação do teste), senão a tela oferece 'Abrir OS'.
+    Também mantém visíveis OS antigas que estão 'aguardando_teste' mas nem existem no painel (legado)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    por_num, todos = {}, []
+    for owner, d in _all_filial_drafts(full_data, user):
+        n = str(d.get('omieOsNumber') or '').strip()
+        todos.append(d)
+        if n:
+            por_num.setdefault(n, []).append(d)
+    nums_no_painel = {str(o.get('os') or '').strip() for o in p['ordens'].values() if o.get('os')}
+
+    def _pref(d):   # prefere a OS ainda em teste; depois a mais recente
+        return ((d.get('execEstado') or '') == 'aguardando_teste', d.get('createdAt') or '')
+
+    saida = []
+    cartoes = [o for o in p['ordens'].values() if o.get('col') == 'teste']
+    for o in sorted(cartoes, key=lambda c: (c.get('dTeste') or c.get('dChegada') or '', c['id'])):
+        num = str(o.get('os') or '').strip()
+        cands = por_num.get(num, []) if num else []
+        d = max(cands, key=_pref) if cands else None
+        equip = ' '.join(x for x in (o.get('equipamento'), o.get('modelo')) if x)
+        saida.append({
+            "painelId": o['id'], "osNum": num, "cliente": o.get('cliente') or (((d or {}).get('client') or {}).get('name') or '') or 'Sem cliente',
+            "equipamento": equip, "serie": o.get('serie') or '',
+            "osId": d.get('id') if d else None, "os": _strip_part_photos(d) if d else None, "legado": False,
+        })
+    for d in todos:   # legado: aguardando teste, sem cartão no painel
+        n = str(d.get('omieOsNumber') or '').strip()
+        if (d.get('execEstado') or '') == 'aguardando_teste' and (not n or n not in nums_no_painel):
+            saida.append({
+                "painelId": None, "osNum": n, "cliente": ((d.get('client') or {}).get('name') or 'Sem cliente'),
+                "equipamento": (d.get('fromLaudo') or {}).get('model') or '', "serie": '',
+                "osId": d.get('id'), "os": _strip_part_photos(d), "legado": True,
+            })
+    return jsonify({"items": saida, "total": len(saida)})
+
+
 @app.route('/api/os', methods=['GET'])
 def os_list():
     user, full_data, err = _require_user()
@@ -5535,6 +5578,8 @@ HTML_PAGE = """
             const [execPecasSalvando, setExecPecasSalvando] = useState(false);
             const [bancadaOps, setBancadaOps] = useState([]);      // bancada guiada pelo Omie
             const [bancadaLoading, setBancadaLoading] = useState(false);
+            const [testeOps, setTesteOps] = useState([]);          // cartões do painel em Teste de Equipamento
+            const [testeLoading, setTesteLoading] = useState(false);
             // Aba "Teste e Liberação" (execEstado === 'aguardando_teste')
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
@@ -5734,6 +5779,16 @@ HTML_PAGE = """
             // Bancada "Serviços a executar": puxa do OMIE as oportunidades em Preparação
             // (uma por op, sem duplicata) já ligadas à OS do app. Fonte da verdade é o Omie,
             // não a fase cacheada — assim nada fica velho nem duplicado.
+            const fetchTeste = async () => {
+                setTesteLoading(true);
+                try {
+                    const r = await fetch('/api/os/teste', { headers: { 'Authorization': auth.token } });
+                    const d = await r.json();
+                    if (d && Array.isArray(d.items)) setTesteOps(d.items);
+                } catch (e) {}
+                setTesteLoading(false);
+            };
+            useEffect(() => { if (auth) fetchTeste(); }, [auth]);   // pro selo da aba
             const fetchBancada = async () => {
                 setBancadaLoading(true);
                 try {
@@ -5780,6 +5835,9 @@ HTML_PAGE = """
                 // A bancada é guiada pelo Omie (não pela lista local) -> busca própria.
                 if (auth && activeTab === 'executar') {
                     fetchBancada();
+                }
+                if (auth && activeTab === 'teste') {
+                    fetchTeste();
                 }
                 if (auth && activeTab === 'os') {
                     if (!omieStatus.checked) checkOmieStatus();
@@ -6060,6 +6118,7 @@ HTML_PAGE = """
                     }).then(r => r.json());
                     if (d.error) { alert('Erro: ' + d.error); return; }
                     fetchBancada();
+                    fetchTeste();
                     fetchOsDrafts();
                 } catch (e) {
                     alert('Erro de rede: ' + (e.message || e));
@@ -8906,7 +8965,7 @@ HTML_PAGE = """
             };
 
             const testeLiberar = async (o) => {
-                if (!confirm('Liberar o equipamento?\\n\\nO teste será registrado como APROVADO e a oportunidade vai para "04 Finalizadas" no Omie.')) return;
+                if (!confirm('Liberar o equipamento?\\n\\nO teste será registrado como APROVADO e o cartão do painel vai para "Finalizado".')) return;
                 setTesteLiberando(true);
                 try {
                     await testeSalvarCampos(o.id, { obsTeste: o.obsTeste || '' });
@@ -8939,7 +8998,8 @@ HTML_PAGE = """
             };
 
             const renderTesteLiberacao = () => {
-                const lista = (osDrafts || []).filter(o => o.execEstado === 'aguardando_teste');
+                // Fonte: cartões do painel em Teste de Equipamento. A OS do Smart vem de osDrafts (estado vivo do checklist).
+                const lista = (testeOps || []).map(e => ({ e, o: e.osId ? ((osDrafts || []).find(d => d.id === e.osId) || e.os) : null }));
                 const itens = testesChecklist || [];
                 return html`
                     <div className="space-y-4">
@@ -8947,8 +9007,9 @@ HTML_PAGE = """
                             <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
                                 <i className="ph-fill ph-test-tube text-cyan-500 text-2xl"></i> Teste e Liberação
                                 <span className="text-sm font-normal text-slate-400">(${lista.length} aguardando teste)</span>
+                                <button onClick=${fetchTeste} disabled=${testeLoading} className="ml-auto bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1 disabled:opacity-50"><i className=${`ph-bold ph-arrows-clockwise ${testeLoading ? 'animate-spin' : ''}`}></i> Atualizar</button>
                             </h2>
-                            <p className="text-sm text-slate-500 mt-1">Serviços finalizados na bancada, aguardando o teste final antes de liberar o equipamento.</p>
+                            <p className="text-sm text-slate-500 mt-1">Equipamentos em "Teste de Equipamento" no Painel de Manutenção, aguardando o teste final antes de liberar.</p>
                         </div>
 
                         ${!lista.length ? html`
@@ -8956,7 +9017,18 @@ HTML_PAGE = """
                                 <i className="ph ph-check-circle text-5xl mb-2"></i>
                                 <p>Nenhum equipamento aguardando teste.</p>
                             </div>
-                        ` : lista.map(o => {
+                        ` : lista.map(({ e, o }) => {
+                            if (!o) {
+                                return html`
+                                    <div key=${e.painelId} className="bg-white rounded-xl shadow-sm border border-dashed border-amber-300 p-4">
+                                        <div className="font-semibold text-slate-800">${e.cliente || 'Sem cliente'}</div>
+                                        <div className="text-xs text-slate-500">${e.osNum ? html`OS <span className="font-mono">${e.osNum}</span> · ` : ''}${e.equipamento || 'Equipamento'}${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}</div>
+                                        ${e.osNum ? html`
+                                            <button onClick=${() => abrirOsDoPainel(e.osNum)} disabled=${puxandoOs === e.osNum} className="mt-2 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-60">
+                                                ${puxandoOs === e.osNum ? 'Abrindo…' : 'Abrir OS ' + e.osNum + ' do Omie para testar'}
+                                            </button>` : html`<p className="text-xs text-amber-600 mt-2"><i className="ph-bold ph-warning"></i> Este cartão do painel ainda não tem o nº da OS — peça ao vendedor para preenchê-lo.</p>`}
+                                    </div>`;
+                            }
                             const aberta = testeAbertaId === o.id;
                             const marcados = itens.filter(t => (o.checklistTestes || {})[t.id]).length;
                             const tudoOk = itens.length > 0 && marcados === itens.length;
@@ -8964,10 +9036,9 @@ HTML_PAGE = """
                                 <div key=${o.id} className="bg-white rounded-xl shadow-sm border ${tudoOk ? 'border-emerald-300' : 'border-slate-200'} overflow-hidden">
                                     <button onClick=${() => { setTesteAbertaId(aberta ? null : o.id); setTesteMotivo(''); }} className="w-full p-4 flex items-center justify-between gap-3 hover:bg-slate-50 text-left">
                                         <div className="min-w-0">
-                                            <div className="font-semibold text-slate-800 truncate">${(o.client && o.client.name) || 'Sem cliente'}</div>
+                                            <div className="font-semibold text-slate-800 truncate">${e.cliente || (o.client && o.client.name) || 'Sem cliente'}</div>
                                             <div className="text-xs text-slate-500 truncate">
-                                                ${o.crmOpNum ? html`<span className="font-mono">${o.crmOpNum}</span> · ` : ''}
-                                                ${(o.fromLaudo && o.fromLaudo.model) || 'Equipamento'}
+                                                ${e.equipamento || (o.fromLaudo && o.fromLaudo.model) || 'Equipamento'}${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}
                                                 ${o.omieOsNumber ? html` · OS ${o.omieOsNumber}` : ''}
                                             </div>
                                         </div>
@@ -9017,7 +9088,7 @@ HTML_PAGE = """
                                                     <i className="ph-bold ph-seal-check"></i> ${testeLiberando ? 'Liberando…' : 'Aprovar e liberar'}
                                                 </button>
                                             </div>
-                                            <p className="text-xs text-slate-400 text-center">Aprovar move a oportunidade para "04 Finalizadas" no Omie.</p>
+                                            <p className="text-xs text-slate-400 text-center">Aprovar move o cartão do painel para "Finalizado".</p>
                                         </div>
                                     `}
                                 </div>`;
@@ -10170,7 +10241,7 @@ HTML_PAGE = """
                             </button>
                             <button onClick=${() => setActiveTab('teste')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'teste' ? 'bg-white text-cyan-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
                                 <i className="ph-bold ph-test-tube"></i> Teste e Liberação
-                                ${(() => { const n = (osDrafts || []).filter(o => o.execEstado === 'aguardando_teste').length; return n ? html`<span className="bg-cyan-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">${n}</span>` : ''; })()}
+                                ${(() => { const n = testeOps.length; return n ? html`<span className="bg-cyan-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">${n}</span>` : ''; })()}
                             </button>
                             <button onClick=${() => setActiveTab('historico')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'historico' ? 'bg-white text-emerald-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clock-counter-clockwise"></i> Histórico</button>
                             <button onClick=${() => { setActiveTab('os'); setCurrentOs(null); }} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'os' ? 'bg-white text-indigo-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clipboard-text"></i> Ordens de Serviço</button>
