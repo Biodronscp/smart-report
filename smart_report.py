@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response, g
+from flask import Flask, jsonify, request, Response, g, send_from_directory
 import json
 import os
 import socket
@@ -15,6 +15,9 @@ from urllib.error import HTTPError, URLError
 import bcrypt
 
 app = Flask(__name__)
+# Papéis de usuário. admin = administrador do Smart; admin_master/vendedor/expedicao entram no Painel de Manutenção
+# (user e almoxarife = Manutenção). Ver seção PAINEL DE MANUTENÇÃO.
+PAPEIS_VALIDOS = ('user', 'almoxarife', 'vendedor', 'expedicao', 'admin_master', 'admin')
 # Teste de auto-deploy (2026-09-22): confirma que o webhook GitHub->Render
 # voltou a funcionar sozinho depois de reconectar a Source pra Biodronscp/smart-report.
 # Limite de upload (fotos/PDF em base64): 60 MB
@@ -842,7 +845,7 @@ def manage_users():
         body = request.json or {}
         new_user = (body.get('username') or '').strip()
         new_pass = body.get('password') or ''
-        new_role = body.get('role') if body.get('role') in ('user', 'almoxarife', 'admin') else 'user'
+        new_role = body.get('role') if body.get('role') in PAPEIS_VALIDOS else 'user'
         first = (body.get('firstName') or '').strip()
         last = (body.get('lastName') or '').strip()
         email = (body.get('email') or '').strip().lower()
@@ -897,7 +900,7 @@ def approve_user(username):
     full_data['users'][username]['status'] = 'active'
     # Permite definir o papel (usuário comum / admin) já no momento da aprovação.
     new_role = body.get('role')
-    if new_role in ('user', 'almoxarife', 'admin'):
+    if new_role in PAPEIS_VALIDOS:
         full_data['users'][username]['role'] = new_role
     # Permite ajustar as filiais do usuário na aprovação (se o admin enviar).
     if body.get('filialIds') is not None:
@@ -1288,6 +1291,7 @@ def export_config():
         "filiais": full_data.get('filiais', {}),  # cuidado: inclui Omie App Secret por filial
         "requisicoes": full_data.get('requisicoes', []),  # requisições de peças ao almoxarifado
         "reqSeq": full_data.get('reqSeq', 0),
+        "painel": full_data.get('painel', {}),  # painel de manutenção (kanban)
         "exportedAt": datetime.utcnow().isoformat() + "Z"
     })
 
@@ -1309,6 +1313,8 @@ def import_config():
         full_data['userStates'] = payload['userStates']
     if 'filiais' in payload:
         full_data['filiais'] = payload['filiais']
+    if 'painel' in payload:
+        full_data['painel'] = payload['painel']
     if 'requisicoes' in payload:
         full_data['requisicoes'] = payload['requisicoes']
         full_data['reqSeq'] = payload.get('reqSeq', full_data.get('reqSeq', 0))
@@ -1324,7 +1330,7 @@ def change_role(username):
     if username not in full_data['users']:
         return jsonify({"error": "Usuário não encontrado"}), 404
     new_role = (request.json or {}).get('role')
-    if new_role not in ('user', 'almoxarife', 'admin'):
+    if new_role not in PAPEIS_VALIDOS:
         return jsonify({"error": "Role inválido"}), 400
     if username == user and new_role != 'admin':
         return jsonify({"error": "Você não pode rebaixar a si mesmo"}), 400
@@ -2826,6 +2832,288 @@ def omie_produtos():
         })
     except OmieError as e:
         return jsonify({"error": str(e)}), e.status
+
+
+# ==========================================================
+#  PAINEL DE MANUTENÇÃO (kanban de acompanhamento das OS)
+#  Front estático em /painel/ (pasta painel/ do repo), mesmo login do Smart. Os dados ficam em
+#  full_data['painel'] = {cols, ordens{id:...}, valores{id:...}, vis{perfil:...}, rev}.
+#  TODAS as permissões são aplicadas AQUI (o front só espelha): ver regras em painel/BACKEND.md.
+# ==========================================================
+PAINEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'painel')
+PAINEL_COLS_PADRAO = [
+    ("chegada", "Chegada de Equipamento"), ("analise", "Aguardando Análise"), ("aprov", "Aguardando Aprovação"),
+    ("fila", "Fila de Manutenção"), ("exec", "Em Execução"), ("teste", "Teste de Equipamento"),
+    ("final", "Finalizado"), ("condenado", "Equipamentos Condenados"), ("pronto", "Prontos para Envio"),
+    ("enviado", "Enviados"),
+]
+PAINEL_COLS_BASE = {c[0] for c in PAINEL_COLS_PADRAO}
+PAINEL_VIS_PADRAO = {   # None = todos os kanbans
+    "admin": None, "vendedor": None,
+    "manutencao": ["analise", "fila", "exec", "teste"],
+    "expedicao": ["chegada", "final", "condenado", "pronto", "enviado"],
+}
+PAINEL_CAMPOS = ("col", "equipamento", "modelo", "serie", "os", "cliente", "garantia", "tecnico", "vendedor", "enviado",
+                 "rastreio", "dChegada", "dAnalise", "dAprovacao", "dExecucao", "dTeste", "dFinalizado", "dEnvio")
+PAINEL_DATAS = ("dChegada", "dAnalise", "dAprovacao", "dExecucao", "dTeste", "dFinalizado", "dEnvio")
+PAINEL_SEMPRE_EDITAVEL = ("tecnico", "enviado")   # + garantia para o Vendedor; "col" muda sempre
+PAINEL_REQ_CHEGADA = ("equipamento", "modelo", "serie", "dChegada")
+PAINEL_PERFIS = ("admin", "vendedor", "manutencao", "expedicao")
+
+
+def _painel_perfil(full_data, user):
+    role = (full_data['users'][user].get('role') or 'user')
+    return {"admin": "admin", "admin_master": "admin", "vendedor": "vendedor",
+            "expedicao": "expedicao"}.get(role, "manutencao")
+
+
+def _painel_estado(full_data):
+    p = full_data.setdefault('painel', {})
+    if not p.get('cols'):
+        p['cols'] = [{"id": i, "name": n, "custom": False} for i, n in PAINEL_COLS_PADRAO]
+    p.setdefault('ordens', {})
+    p.setdefault('valores', {})
+    p.setdefault('vis', {})
+    p.setdefault('rev', 0)
+    return p
+
+
+def _painel_colunas_visiveis(p, perfil):
+    """Lista de ids de kanban visíveis ao perfil (None = todos)."""
+    if perfil == 'admin':
+        return None
+    cfg = (p['vis'].get(perfil) or {}).get('colunas')
+    if cfg is not None:
+        return list(cfg)
+    return PAINEL_VIS_PADRAO.get(perfil)
+
+
+def _painel_ve_valores(perfil):
+    return perfil in ('admin', 'vendedor')
+
+
+def _painel_num(v):
+    """'R$ 1.500,50' | '1500.5' | '1.500' -> float (mesma conversão do front)."""
+    t = re.sub(r'[^\d.,-]', '', str(v or ''))
+    if not t:
+        return 0.0
+    if ',' in t:
+        t = t.replace('.', '').replace(',', '.')
+    elif re.fullmatch(r'-?\d{1,3}(\.\d{3})+', t):
+        t = t.replace('.', '')
+    try:
+        return float(t)
+    except ValueError:
+        return 0.0
+
+
+def _painel_ordem_view(p, o, com_valor):
+    v = p['valores'].get(o['id']) or {}
+    out = {**o, "valorProposta": "", "valorBase": ""}
+    if com_valor:
+        out["valorProposta"] = v.get('valorProposta', '')
+        out["valorBase"] = v.get('valorBase', '')
+    return out
+
+
+def _painel_bump(p):
+    p['rev'] = int(p.get('rev') or 0) + 1
+
+
+@app.route('/painel/')
+def painel_index():
+    resp = send_from_directory(PAINEL_DIR, 'index.html')
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.route('/painel/<path:arq>')
+def painel_arquivo(arq):
+    resp = send_from_directory(PAINEL_DIR, arq)
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.route('/api/painel', methods=['GET'])
+def painel_carregar():
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    perfil = _painel_perfil(full_data, user)
+    vis = _painel_colunas_visiveis(p, perfil)
+    com_valor = _painel_ve_valores(perfil)
+    ordens = [_painel_ordem_view(p, o, com_valor) for o in p['ordens'].values()
+              if vis is None or o.get('col') in vis]
+    ordens.sort(key=lambda o: (o.get('criadoEm') or '', o['id']))
+    resumo = {c['id']: {"col": c['id'], "qtd": 0, "valor": 0.0 if com_valor else None} for c in p['cols']}
+    for o in p['ordens'].values():
+        r = resumo.get(o.get('col'))
+        if r is None:
+            continue
+        r['qtd'] += 1
+        if com_valor:
+            r['valor'] += _painel_num((p['valores'].get(o['id']) or {}).get('valorProposta'))
+    return jsonify({
+        "perfil": perfil, "rev": p['rev'], "cols": p['cols'], "ordens": ordens,
+        "vis": {k: v for k, v in p['vis'].items()}, "resumo": list(resumo.values()),
+        "visPadrao": PAINEL_VIS_PADRAO,
+    })
+
+
+@app.route('/api/painel/rev', methods=['GET'])
+def painel_rev():
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    return jsonify({"rev": _painel_estado(full_data)['rev']})
+
+
+def _painel_valida_campo(k, v):
+    """Normaliza um valor de campo; devolve (ok, valor)."""
+    v = '' if v is None else str(v).strip()[:200]
+    if k in PAINEL_DATAS:
+        if v and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', v):
+            return False, v
+    return True, v
+
+
+@app.route('/api/painel/ordem', methods=['POST'])
+def painel_gravar_ordem():
+    """Cria ou atualiza (parcialmente) uma OS do painel. Body: {id, novo, campos:{...}, valor:{valorProposta,valorBase}}."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    perfil = _painel_perfil(full_data, user)
+    body = request.json or {}
+    oid = str(body.get('id') or '')
+    if not re.fullmatch(r'[0-9a-fA-F-]{8,64}', oid):
+        return jsonify({"error": "id inválido"}), 400
+    campos = body.get('campos') or {}
+    valor = body.get('valor')
+    ids_col = {c['id'] for c in p['cols']}
+    agora = datetime.utcnow().isoformat() + "Z"
+
+    limpos = {}
+    for k, v in campos.items():
+        if k not in PAINEL_CAMPOS:
+            continue
+        ok_, v = _painel_valida_campo(k, v)
+        if not ok_:
+            return jsonify({"error": f"Data inválida em {k}"}), 400
+        if k == 'col' and v not in ids_col:
+            return jsonify({"error": "Kanban inexistente"}), 400
+        limpos[k] = v
+
+    if body.get('novo'):
+        if oid in p['ordens']:
+            return jsonify({"error": "OS já existe"}), 409
+        if perfil not in ('admin', 'vendedor', 'expedicao'):
+            return jsonify({"error": "Seu perfil não cria OS"}), 403
+        if perfil == 'expedicao' and limpos.get('col') != 'chegada':
+            return jsonify({"error": "A Expedição só cria OS em Chegada de Equipamento"}), 403
+        if any(not limpos.get(k) for k in PAINEL_REQ_CHEGADA):
+            return jsonify({"error": "Equipamento, modelo, série e data de chegada são obrigatórios"}), 400
+        o = {"id": oid, "criadoEm": agora, "criadoPor": user}
+        for k in PAINEL_CAMPOS:
+            o[k] = limpos.get(k, '')
+        o['col'] = o['col'] or 'chegada'
+        o['enviado'] = o['enviado'] or 'Não'
+        p['ordens'][oid] = o
+    else:
+        o = p['ordens'].get(oid)
+        vis = _painel_colunas_visiveis(p, perfil)
+        if not o or (vis is not None and o.get('col') not in vis):
+            return jsonify({"error": "OS não encontrada"}), 404
+        if o.get('col') == 'enviado' and perfil != 'admin':
+            return jsonify({"error": "Esta OS já foi enviada; só o Administrador altera"}), 403
+        for k, v in limpos.items():
+            antigo = str(o.get(k) or '')
+            if v == antigo or k == 'col' or perfil == 'admin' or antigo == '':
+                continue
+            if k in PAINEL_SEMPRE_EDITAVEL or (k == 'garantia' and perfil == 'vendedor'):
+                continue
+            return jsonify({"error": f"O campo {k} já foi preenchido e não pode mudar"}), 403
+        o.update(limpos)
+        o['atualizadoEm'] = agora
+        o['atualizadoPor'] = user
+
+    if valor is not None:
+        if not _painel_ve_valores(perfil):
+            return jsonify({"error": "Seu perfil não grava valores"}), 403
+        p['valores'][oid] = {"valorProposta": str(valor.get('valorProposta') or '')[:40],
+                             "valorBase": str(valor.get('valorBase') or '')[:40]}
+    _painel_bump(p)
+    save_data(full_data)
+    return jsonify(_painel_ordem_view(p, o, _painel_ve_valores(perfil)))
+
+
+@app.route('/api/painel/ordem/<oid>', methods=['DELETE'])
+def painel_excluir_ordem(oid):
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    if _painel_perfil(full_data, user) != 'admin':
+        return jsonify({"error": "Apenas o Administrador exclui OS"}), 403
+    if p['ordens'].pop(oid, None) is None:
+        return jsonify({"error": "OS não encontrada"}), 404
+    p['valores'].pop(oid, None)
+    _painel_bump(p)
+    save_data(full_data)
+    return jsonify({"success": True})
+
+
+@app.route('/api/painel/colunas', methods=['POST'])
+def painel_gravar_colunas():
+    """Lista completa de kanbans (ordem e nomes). Só Administrador. Não remove kanban base nem com OS dentro."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    if _painel_perfil(full_data, user) != 'admin':
+        return jsonify({"error": "Apenas o Administrador altera kanbans"}), 403
+    novas = []
+    for c in (request.json or {}).get('cols') or []:
+        cid = str(c.get('id') or '')
+        nome = str(c.get('name') or '').strip()[:60]
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', cid) or not nome:
+            return jsonify({"error": "Kanban inválido"}), 400
+        novas.append({"id": cid, "name": nome, "custom": cid not in PAINEL_COLS_BASE})
+    ids_novos = {c['id'] for c in novas}
+    if len(ids_novos) != len(novas) or not PAINEL_COLS_BASE <= ids_novos:
+        return jsonify({"error": "Os kanbans padrão não podem ser removidos"}), 400
+    em_uso = {o.get('col') for o in p['ordens'].values()}
+    if em_uso - ids_novos:
+        return jsonify({"error": "Há OS em kanban que seria removido"}), 400
+    p['cols'] = novas
+    _painel_bump(p)
+    save_data(full_data)
+    return jsonify({"success": True})
+
+
+@app.route('/api/painel/visibilidade', methods=['POST'])
+def painel_gravar_visibilidade():
+    """Visibilidade de kanbans e cards do topo por perfil. Só Administrador. Body: {linhas:[{perfil,colunas,cards?}]}."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    if _painel_perfil(full_data, user) != 'admin':
+        return jsonify({"error": "Apenas o Administrador altera a visibilidade"}), 403
+    ids_col = {c['id'] for c in p['cols']}
+    for l in (request.json or {}).get('linhas') or []:
+        perfil = l.get('perfil')
+        if perfil not in PAINEL_PERFIS:
+            return jsonify({"error": "Perfil inválido"}), 400
+        linha = p['vis'].setdefault(perfil, {})
+        linha['colunas'] = [c for c in (l.get('colunas') or []) if c in ids_col]
+        if l.get('cards') is not None:
+            linha['cards'] = [c for c in l['cards'] if c in ids_col or c in ('aberto', 'atrasadas')]
+    _painel_bump(p)
+    save_data(full_data)
+    return jsonify({"success": True})
 
 
 # ==========================================================
@@ -5477,6 +5765,11 @@ HTML_PAGE = """
                 const stored = localStorage.getItem('smartReportAuth');
                 return stored ? JSON.parse(stored) : null;
             });
+
+            // Vendedor e Expedição só usam o Painel de Manutenção (Smart = login único)
+            if (auth && (auth.role === 'vendedor' || auth.role === 'expedicao') && !location.pathname.startsWith('/painel')) {
+                location.replace('/painel/');
+            }
 
             // Tabs e UX
             const [activeTab, setActiveTab] = useState('report');
@@ -8695,7 +8988,12 @@ HTML_PAGE = """
                 const trocarRoleUsuario = (u, novoRole) => {
                     if (novoRole === u.role) return;
                     const nome = (u.firstName ? `${u.firstName} ${u.lastName || ''}`.trim() : u.username);
-                    const aviso = novoRole === 'almoxarife'
+                    const avisoPainel = {
+                        vendedor: `Tornar ${nome} VENDEDOR?\\n\\nEle passa a usar só o Painel de Manutenção: cria OS, vê valores e preenche a proposta. Não acessa o restante do Smart.`,
+                        expedicao: `Tornar ${nome} EXPEDIÇÃO?\\n\\nEle passa a usar só o Painel de Manutenção: registra a chegada e o envio dos equipamentos, sem ver valores.`,
+                        admin_master: `Tornar ${nome} ADMINISTRADOR MASTER?\\n\\nControle total do Painel de Manutenção (kanbans, visibilidade, valores, exclusão). No restante do Smart ele continua como usuário padrão.`
+                    }[novoRole];
+                    const aviso = avisoPainel ? avisoPainel : novoRole === 'almoxarife'
                         ? `Tornar ${nome} ALMOXARIFE?\\n\\nEle passa a ver e atender TODAS as requisições de peças da filial (separar, entregar, recusar). Continua sem acesso a Templates, Usuários e valores.`
                         : novoRole === 'admin'
                         ? `Tornar ${nome} ADMIN?\\n\\nAdmin vê valores e totais, edita Templates/Modelos, gerencia usuários e configurações do sistema.`
@@ -8769,6 +9067,9 @@ HTML_PAGE = """
                                                     <select value=${approveRole[u.username] || 'user'} onChange=${e => setApproveRole({ ...approveRole, [u.username]: e.target.value })} className="p-2 border border-slate-300 rounded text-sm bg-white" title="Papel ao aprovar">
                                                         <option value="user">Usuário comum</option>
                                                         <option value="almoxarife">Almoxarife</option>
+                                                        <option value="vendedor">Vendedor (Painel)</option>
+                                                        <option value="expedicao">Expedição (Painel)</option>
+                                                        <option value="admin_master">Administrador Master (Painel)</option>
                                                         <option value="admin">Administrador</option>
                                                     </select>
                                                     <button onClick=${() => callUserAction(u.username, 'approve', { body: { role: approveRole[u.username] || 'user', filialIds: approveFiliais[u.username] || u.filialIds || ['matriz'] } })} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium text-sm flex items-center gap-1"><i className="ph-bold ph-check"></i> Aprovar</button>
@@ -8795,6 +9096,9 @@ HTML_PAGE = """
                                 <select name="newRole" className="p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none bg-white">
                                     <option value="user">Usuário Padrão</option>
                                     <option value="almoxarife">Almoxarife</option>
+                                    <option value="vendedor">Vendedor (Painel)</option>
+                                    <option value="expedicao">Expedição (Painel)</option>
+                                    <option value="admin_master">Administrador Master (Painel)</option>
                                     <option value="admin">Administrador</option>
                                 </select>
                                 <div className="md:col-span-2 border border-slate-200 rounded p-2">
@@ -8846,9 +9150,12 @@ HTML_PAGE = """
                                                                 disabled=${euMesmo}
                                                                 title=${euMesmo ? 'Você não pode alterar o seu próprio nível de acesso' : 'Alterar nível de acesso'}
                                                                 onChange=${e => trocarRoleUsuario(u, e.target.value)}
-                                                                className=${`px-2 py-1 rounded text-xs font-bold border outline-none ${euMesmo ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'} ${u.role === 'admin' ? 'bg-indigo-100 text-indigo-700 border-indigo-300' : (u.role === 'almoxarife' ? 'bg-orange-100 text-orange-700 border-orange-300' : 'bg-slate-200 text-slate-700 border-slate-300')}`}>
+                                                                className=${`px-2 py-1 rounded text-xs font-bold border outline-none ${euMesmo ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'} ${u.role === 'admin' ? 'bg-indigo-100 text-indigo-700 border-indigo-300' : (u.role === 'almoxarife' ? 'bg-orange-100 text-orange-700 border-orange-300' : (u.role === 'admin_master' ? 'bg-fuchsia-100 text-fuchsia-700 border-fuchsia-300' : (u.role === 'vendedor' || u.role === 'expedicao' ? 'bg-teal-100 text-teal-700 border-teal-300' : 'bg-slate-200 text-slate-700 border-slate-300')))}`}>
                                                                 <option value="user">USER</option>
                                                                 <option value="almoxarife">ALMOXARIFE</option>
+                                                                <option value="vendedor">VENDEDOR</option>
+                                                                <option value="expedicao">EXPEDIÇÃO</option>
+                                                                <option value="admin_master">ADMIN MASTER</option>
                                                                 <option value="admin">ADMIN</option>
                                                             </select>`;
                                                     })()}
@@ -10324,6 +10631,7 @@ HTML_PAGE = """
                             <button onClick=${() => setActiveTab('historico')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'historico' ? 'bg-white text-emerald-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clock-counter-clockwise"></i> Histórico</button>
                             <button onClick=${() => { setActiveTab('os'); setCurrentOs(null); }} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'os' ? 'bg-white text-indigo-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clipboard-text"></i> Ordens de Serviço</button>
                             <button onClick=${() => setActiveTab('crm')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'crm' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-funnel"></i> Oportunidades (CRM)</button>
+                            <a href="/painel/" className="whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all text-slate-600 hover:bg-slate-300"><i className="ph-bold ph-kanban"></i> Painel de Manutenção</a>
 
                             <button onClick=${() => setActiveTab('requisicoes')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'requisicoes' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
                                 <i className="ph-bold ph-package"></i> Requisições
