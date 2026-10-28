@@ -97,6 +97,37 @@ def _resolve_token(full_data, token):
     return username
 
 
+# -------- Vendedor e Expedição: só o Painel de Manutenção (bloqueio no SERVIDOR) --------
+# O redirecionamento do front é só conveniência; aqui impedimos que esses papéis chamem as demais APIs do Smart.
+PAPEIS_SO_PAINEL = ('vendedor', 'expedicao')
+_API_LIVRE_SO_PAINEL = ('/api/painel', '/api/login', '/api/logout', '/api/logo', '/api/change-password', '/api/register')
+_PAPEL_CACHE = {}   # token -> (papel, válido até); evita reler o banco a cada chamada
+
+
+@app.before_request
+def _restringe_papeis_so_painel():
+    path = request.path
+    if not path.startswith('/api/') or path.startswith(_API_LIVRE_SO_PAINEL):
+        return None
+    token = request.headers.get('Authorization')
+    if not token:
+        return None
+    agora = datetime.utcnow().timestamp()
+    hit = _PAPEL_CACHE.get(token)
+    if hit and hit[1] > agora:
+        papel = hit[0]
+    else:
+        fd = load_data()
+        u = _resolve_token(fd, token)
+        papel = (fd['users'][u].get('role') or 'user') if u else None
+        if len(_PAPEL_CACHE) > 500:
+            _PAPEL_CACHE.clear()
+        _PAPEL_CACHE[token] = (papel, agora + 30)
+    if papel in PAPEIS_SO_PAINEL:
+        return jsonify({"error": "Seu perfil usa apenas o Painel de Manutenção"}), 403
+    return None
+
+
 # -------- Rate limit simples de login (em memória) --------
 _login_attempts = {}  # username -> [timestamps]
 
