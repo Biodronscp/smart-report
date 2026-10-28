@@ -97,17 +97,32 @@ def _resolve_token(full_data, token):
     return username
 
 
-# -------- Vendedor e Expedição: só o Painel de Manutenção (bloqueio no SERVIDOR) --------
-# O redirecionamento do front é só conveniência; aqui impedimos que esses papéis chamem as demais APIs do Smart.
-PAPEIS_SO_PAINEL = ('vendedor', 'expedicao')
-_API_LIVRE_SO_PAINEL = ('/api/painel', '/api/login', '/api/logout', '/api/logo', '/api/change-password', '/api/register')
+# -------- Acesso técnico só para quem é da área (bloqueio no SERVIDOR) --------
+# Vendedor e Expedição usam apenas o Painel de Manutenção; o Almoxarife usa Requisições (e o Painel). O redirecionamento
+# e as abas escondidas no front são só conveniência: aqui impedimos que esses papéis chamem as demais APIs do Smart.
+MSG_SEM_PERMISSAO = "Você não tem permissão para acesso. Caso necessite, entre em contato com o Administrador"
+_API_LIVRE_RESTRITOS = ('/api/painel', '/api/login', '/api/logout', '/api/logo', '/api/change-password',
+                        '/api/register', '/api/filiais-publicas')
+# prefixos extras por papel (qualquer método) e rotas exatas só de leitura (GET)
+_API_EXTRA_POR_PAPEL = {
+    'vendedor': (),
+    'expedicao': (),
+    'almoxarife': ('/api/requisicoes', '/api/omie/produtos'),
+}
+_API_GET_POR_PAPEL = {
+    'almoxarife': ('/api/data', '/api/os'),
+}
 _PAPEL_CACHE = {}   # token -> (papel, válido até); evita reler o banco a cada chamada
 
 
+def _sem_permissao():
+    return jsonify({"error": MSG_SEM_PERMISSAO, "semPermissao": True}), 403
+
+
 @app.before_request
-def _restringe_papeis_so_painel():
+def _restringe_papeis_fora_da_area():
     path = request.path
-    if not path.startswith('/api/') or path.startswith(_API_LIVRE_SO_PAINEL):
+    if not path.startswith('/api/') or path.startswith(_API_LIVRE_RESTRITOS):
         return None
     token = request.headers.get('Authorization')
     if not token:
@@ -123,9 +138,13 @@ def _restringe_papeis_so_painel():
         if len(_PAPEL_CACHE) > 500:
             _PAPEL_CACHE.clear()
         _PAPEL_CACHE[token] = (papel, agora + 30)
-    if papel in PAPEIS_SO_PAINEL:
-        return jsonify({"error": "Seu perfil usa apenas o Painel de Manutenção"}), 403
-    return None
+    if papel not in _API_EXTRA_POR_PAPEL:
+        return None
+    if path.startswith(_API_EXTRA_POR_PAPEL[papel]) and _API_EXTRA_POR_PAPEL[papel]:
+        return None
+    if request.method == 'GET' and path in _API_GET_POR_PAPEL.get(papel, ()):
+        return None
+    return _sem_permissao()
 
 
 # -------- Rate limit simples de login (em memória) --------
@@ -2894,8 +2913,8 @@ PAINEL_PERFIS = ("admin", "vendedor", "manutencao", "expedicao")
 
 def _painel_perfil(full_data, user):
     role = (full_data['users'][user].get('role') or 'user')
-    return {"admin": "admin", "admin_master": "admin", "vendedor": "vendedor",
-            "expedicao": "expedicao"}.get(role, "manutencao")
+    # Controle total do painel = só o Administrador Master. O Admin do Smart controla o Smart e, no painel, é Manutenção.
+    return {"admin_master": "admin", "vendedor": "vendedor", "expedicao": "expedicao"}.get(role, "manutencao")
 
 
 def _painel_estado(full_data):
@@ -3041,7 +3060,7 @@ def painel_gravar_ordem():
         if oid in p['ordens']:
             return jsonify({"error": "OS já existe"}), 409
         if perfil not in ('admin', 'vendedor', 'expedicao'):
-            return jsonify({"error": "Seu perfil não cria OS"}), 403
+            return _sem_permissao()
         if perfil == 'expedicao' and limpos.get('col') != 'chegada':
             return jsonify({"error": "A Expedição só cria OS em Chegada de Equipamento"}), 403
         if any(not limpos.get(k) for k in PAINEL_REQ_CHEGADA):
@@ -3058,7 +3077,7 @@ def painel_gravar_ordem():
         if not o or (vis is not None and o.get('col') not in vis):
             return jsonify({"error": "OS não encontrada"}), 404
         if o.get('col') == 'enviado' and perfil != 'admin':
-            return jsonify({"error": "Esta OS já foi enviada; só o Administrador altera"}), 403
+            return jsonify({"error": "Esta OS já foi enviada; só o Administrador Master altera"}), 403
         for k, v in limpos.items():
             antigo = str(o.get(k) or '')
             if v == antigo or k == 'col' or perfil == 'admin' or antigo == '':
@@ -3072,7 +3091,7 @@ def painel_gravar_ordem():
 
     if valor is not None:
         if not _painel_ve_valores(perfil):
-            return jsonify({"error": "Seu perfil não grava valores"}), 403
+            return _sem_permissao()
         p['valores'][oid] = {"valorProposta": str(valor.get('valorProposta') or '')[:40],
                              "valorBase": str(valor.get('valorBase') or '')[:40]}
     _painel_bump(p)
@@ -3087,7 +3106,7 @@ def painel_excluir_ordem(oid):
         return err
     p = _painel_estado(full_data)
     if _painel_perfil(full_data, user) != 'admin':
-        return jsonify({"error": "Apenas o Administrador exclui OS"}), 403
+        return _sem_permissao()
     if p['ordens'].pop(oid, None) is None:
         return jsonify({"error": "OS não encontrada"}), 404
     p['valores'].pop(oid, None)
@@ -3104,7 +3123,7 @@ def painel_gravar_colunas():
         return err
     p = _painel_estado(full_data)
     if _painel_perfil(full_data, user) != 'admin':
-        return jsonify({"error": "Apenas o Administrador altera kanbans"}), 403
+        return _sem_permissao()
     novas = []
     for c in (request.json or {}).get('cols') or []:
         cid = str(c.get('id') or '')
@@ -3132,7 +3151,7 @@ def painel_gravar_visibilidade():
         return err
     p = _painel_estado(full_data)
     if _painel_perfil(full_data, user) != 'admin':
-        return jsonify({"error": "Apenas o Administrador altera a visibilidade"}), 403
+        return _sem_permissao()
     ids_col = {c['id'] for c in p['cols']}
     for l in (request.json or {}).get('linhas') or []:
         perfil = l.get('perfil')
@@ -5781,6 +5800,7 @@ HTML_PAGE = """
                 color: var(--tx) !important;
             }
         }
+        [data-solo-req] > :not([data-keep]) { display: none !important; }
     </style>
 </head>
 <body class="bg-slate-100 text-slate-800 antialiased print:bg-white">
@@ -5803,7 +5823,9 @@ HTML_PAGE = """
             }
 
             // Tabs e UX
-            const [activeTab, setActiveTab] = useState('report');
+            const soRequisicoes = !!(auth && auth.role === 'almoxarife');   // Almoxarife: só Requisições + Painel
+            const [activeTab, setActiveTab] = useState(soRequisicoes ? 'requisicoes' : 'report');
+            useEffect(() => { if (soRequisicoes && activeTab !== 'requisicoes') setActiveTab('requisicoes'); }, [soRequisicoes, activeTab]);
             const [isLoaded, setIsLoaded] = useState(false);
             const [isSaving, setIsSaving] = useState(false);
             const [loginError, setLoginError] = useState("");
@@ -10640,7 +10662,7 @@ HTML_PAGE = """
                                     ` : (auth.filiais && auth.filiais.length === 1 ? html`<span className="text-slate-500 text-xs mt-1"><i className="ph-fill ph-buildings"></i> ${auth.filiais[0].nome}</span>` : '')}
                                 </div>
                             </div>
-                            <div className="flex gap-2 flex-wrap">
+                            <div style=${soRequisicoes ? { display: 'none' } : undefined} className="flex gap-2 flex-wrap">
                                 <button onClick=${gerarTextoIA} className="px-3 py-2 bg-gradient-to-r from-purple-600 to-fuchsia-600 rounded-lg text-sm font-medium hover:from-purple-500 hover:to-fuchsia-500 transition flex items-center gap-1 shadow-md"><i className="ph-bold ph-sparkle"></i> Laudo IA</button>
                                 <button onClick=${() => setLaudosModalOpen(true)} className="px-3 py-2 bg-slate-700 rounded-lg text-sm font-medium hover:bg-slate-600 transition flex items-center gap-1"><i className="ph-bold ph-archive"></i> Laudos</button>
                                 <button onClick=${downloadImagesZip} className="px-3 py-2 bg-slate-700 rounded-lg text-sm font-medium hover:bg-slate-600 transition flex items-center gap-1" title="Baixar fotos do laudo atual em ZIP"><i className="ph-bold ph-download-simple"></i> Fotos ZIP</button>
@@ -10649,7 +10671,7 @@ HTML_PAGE = """
                             </div>
                         </header>
 
-                        <div className="flex flex-nowrap overflow-x-auto md:flex-wrap md:overflow-x-visible gap-1 mb-6 bg-slate-200 p-1 rounded-xl w-full md:w-fit md:max-w-full">
+                        <div data-solo-req=${soRequisicoes ? "1" : undefined} className="flex flex-nowrap overflow-x-auto md:flex-wrap md:overflow-x-visible gap-1 mb-6 bg-slate-200 p-1 rounded-xl w-full md:w-fit md:max-w-full">
                             <button onClick=${() => setActiveTab('report')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'report' ? 'bg-white text-blue-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-file-text"></i> Preencher Laudo</button>
                             <button onClick=${() => setActiveTab('executar')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'executar' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
                                 <i className="ph-bold ph-wrench"></i> Serviços a executar
@@ -10662,9 +10684,9 @@ HTML_PAGE = """
                             <button onClick=${() => setActiveTab('historico')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'historico' ? 'bg-white text-emerald-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clock-counter-clockwise"></i> Histórico</button>
                             <button onClick=${() => { setActiveTab('os'); setCurrentOs(null); }} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'os' ? 'bg-white text-indigo-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clipboard-text"></i> Ordens de Serviço</button>
                             <button onClick=${() => setActiveTab('crm')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'crm' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-funnel"></i> Oportunidades (CRM)</button>
-                            <a href="/painel/" className="whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all text-slate-600 hover:bg-slate-300"><i className="ph-bold ph-kanban"></i> Painel de Manutenção</a>
+                            <a data-keep="1" href="/painel/" className="whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all text-slate-600 hover:bg-slate-300"><i className="ph-bold ph-kanban"></i> Painel de Manutenção</a>
 
-                            <button onClick=${() => setActiveTab('requisicoes')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'requisicoes' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
+                            <button data-keep="1" onClick=${() => setActiveTab('requisicoes')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'requisicoes' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
                                 <i className="ph-bold ph-package"></i> Requisições
                                 ${(() => { const n = (requisicoes || []).filter(r => r.status === 'pendente').length; return (reqAlmox && n) ? html`<span className="bg-orange-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">${n}</span>` : ''; })()}
                             </button>
