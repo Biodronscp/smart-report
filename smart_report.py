@@ -2303,7 +2303,7 @@ def omie_os_etapas():
     if err:
         return err
     try:
-        data = omie_call('/servicos/etapafat/', 'ListarEtapasFaturamento', {
+        data = omie_call('/produtos/etapafat/', 'ListarEtapasFaturamento', {
             "pagina": 1, "registros_por_pagina": 100
         })
     except OmieNoRecords:
