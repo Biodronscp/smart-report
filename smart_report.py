@@ -2295,6 +2295,35 @@ def omie_os_abertas():
         return jsonify({"error": str(e)}), e.status
 
 
+@app.route('/api/omie/os/etapas', methods=['GET'])
+def omie_os_etapas():
+    """Etapas do kanban de Ordens de Serviço da conta Omie (código → nome). As etapas são
+    configuráveis por conta (3 a 6 colunas, renomeáveis), então o código NÃO é fixo."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    try:
+        data = omie_call('/servicos/etapafat/', 'ListarEtapasFaturamento', {
+            "pagina": 1, "registros_por_pagina": 100
+        })
+    except OmieNoRecords:
+        return jsonify({"etapas": [], "raw": {}})
+    except OmieError as e:
+        return jsonify({"error": str(e)}), e.status
+    etapas = []
+    for op in data.get('cadastros') or data.get('listaEtapas') or []:
+        for et in (op.get('etapas') or []):
+            etapas.append({
+                "operacao": op.get('cCodOperacao'),
+                "operacaoNome": op.get('cDescOperacao'),
+                "codigo": et.get('cCodigo'),
+                "nome": et.get('cDescrPadrao') or et.get('cDescricao'),
+                "personalizado": et.get('cDescrCustom') or '',
+                "inativo": et.get('cInativo'),
+            })
+    return jsonify({"etapas": etapas, "raw": data})
+
+
 @app.route('/api/omie/os/<int:nCodOS>', methods=['GET'])
 def omie_os_consulta(nCodOS):
     """Consulta uma OS específica no Omie e retorna em formato compatível com nosso rascunho."""
