@@ -18,6 +18,9 @@ app = Flask(__name__)
 # Papéis de usuário. admin = administrador do Smart; admin_master/vendedor/expedicao entram no Painel de Manutenção
 # (user e almoxarife = Manutenção). Ver seção PAINEL DE MANUTENÇÃO.
 PAPEIS_VALIDOS = ('user', 'almoxarife', 'vendedor', 'expedicao', 'admin_master', 'admin')
+# Perfis que a própria pessoa pode apontar ao se cadastrar (é só um PEDIDO: quem aprova confirma o papel real).
+# Administrador e Administrador Master nunca são pedidos no cadastro.
+PERFIS_AUTOCADASTRO = ('user', 'almoxarife', 'vendedor', 'expedicao')
 # Teste de auto-deploy (2026-09-22): confirma que o webhook GitHub->Render
 # voltou a funcionar sozinho depois de reconectar a Source pra Biodronscp/smart-report.
 # Limite de upload (fotos/PDF em base64): 60 MB
@@ -182,6 +185,7 @@ def public_user_view(username: str, user: dict) -> dict:
         "email": user.get("email", ""),
         "phone": user.get("phone", ""),
         "mustResetPassword": user.get("mustResetPassword", False),
+        "perfilSolicitado": user.get("perfilSolicitado", ""),
         "createdAt": user.get("createdAt", ""),
         "filialId": user.get("filialId", "matriz"),
         "filialIds": user.get("filialIds") or [user.get("filialId", "matriz")]
@@ -630,8 +634,11 @@ def register():
     last = (data_in.get('lastName') or '').strip()
     email = (data_in.get('email') or '').strip().lower()
     phone = (data_in.get('phone') or '').strip()
+    perfil_pedido = (data_in.get('perfil') or '').strip()
 
     # Validações
+    if perfil_pedido and perfil_pedido not in PERFIS_AUTOCADASTRO:
+        return jsonify({"success": False, "message": "Perfil inválido."}), 400
     if not username or not re.match(r'^[a-zA-Z0-9_.-]{3,30}$', username):
         return jsonify({"success": False, "message": "Login inválido. Use 3-30 caracteres (letras, números, . _ -)."}), 400
     if not password or len(password) < 6:
@@ -657,6 +664,7 @@ def register():
     full_data['users'][username] = {
         "passwordHash": hash_password(password),
         "role": "user",
+        "perfilSolicitado": perfil_pedido,
         "status": "pending",
         "firstName": first,
         "lastName": last,
@@ -5809,6 +5817,7 @@ HTML_PAGE = """
     <script>
         const { useState, useEffect, useRef } = React;
         const html = htm.bind(React.createElement);
+        const NOME_PERFIL = { user: 'Manutenção (técnico)', almoxarife: 'Almoxarife', vendedor: 'Vendedor', expedicao: 'Expedição', admin: 'Administrador', admin_master: 'Administrador Master' };
 
         const App = () => {
             // Autenticação
@@ -5832,6 +5841,7 @@ HTML_PAGE = """
             const [publicLogo, setPublicLogo] = useState(null);
             const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
             const [registerMsg, setRegisterMsg] = useState({ type: '', text: '' });
+            const [regPerfil, setRegPerfil] = useState('');   // perfil que a pessoa aponta ao se cadastrar
             const [mustChangePwd, setMustChangePwd] = useState(false);
             const [pwdChangeMsg, setPwdChangeMsg] = useState("");
             const [tempPasswordInfo, setTempPasswordInfo] = useState(null); // {username, password}
@@ -6866,6 +6876,10 @@ HTML_PAGE = """
                     setRegisterMsg({ type: 'error', text: 'As senhas não coincidem.' });
                     return;
                 }
+                if (!regPerfil) {
+                    setRegisterMsg({ type: 'error', text: 'Selecione o seu perfil.' });
+                    return;
+                }
                 if (filiaisPublicas.length > 0 && regFiliais.length === 0) {
                     setRegisterMsg({ type: 'error', text: 'Selecione ao menos uma filial.' });
                     return;
@@ -6877,6 +6891,7 @@ HTML_PAGE = """
                     lastName: f.lastName.value,
                     email: f.email.value,
                     phone: f.phone.value,
+                    perfil: regPerfil,
                     filialIds: regFiliais
                 };
                 fetch('/api/register', {
@@ -7029,6 +7044,17 @@ HTML_PAGE = """
                                             <label className="block text-xs font-medium text-slate-700 mb-1">Confirmar senha *</label>
                                             <input name="confirmPassword" type="password" required minLength="6" className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm" />
                                         </div>
+                                    </div>
+                                    <div className="border-t border-slate-200 pt-3">
+                                        <label className="block text-xs font-medium text-slate-700 mb-1">Perfil *</label>
+                                        <select value=${regPerfil} onChange=${e => setRegPerfil(e.target.value)} required className="w-full p-2 border border-slate-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 outline-none text-sm">
+                                            <option value="" disabled>Selecione o seu perfil…</option>
+                                            <option value="user">Manutenção (técnico)</option>
+                                            <option value="almoxarife">Almoxarife</option>
+                                            <option value="vendedor">Vendedor</option>
+                                            <option value="expedicao">Expedição</option>
+                                        </select>
+                                        <p className="text-[11px] text-slate-400 mt-1">É um pedido: o administrador confirma o perfil na aprovação.</p>
                                     </div>
                                     ${filiaisPublicas.length > 0 && html`
                                         <div className="border-t border-slate-200 pt-3">
@@ -9100,6 +9126,7 @@ HTML_PAGE = """
                                                 <div className="text-xs text-slate-500 mt-1 flex flex-wrap gap-x-3 gap-y-1">
                                                     <span><i className="ph ph-envelope"></i> ${u.email}</span>
                                                     <span><i className="ph ph-phone"></i> ${u.phone}</span>
+                                                    ${u.perfilSolicitado && html`<span className="text-teal-700 font-medium"><i className="ph ph-identification-badge"></i> Solicitou: ${NOME_PERFIL[u.perfilSolicitado] || u.perfilSolicitado}</span>`}
                                                 </div>
                                             </div>
                                             <div className="flex flex-col gap-2 md:items-end">
@@ -9117,7 +9144,7 @@ HTML_PAGE = """
                                                     </div>
                                                 `}
                                                 <div className="flex gap-2 items-center flex-wrap md:justify-end">
-                                                    <select value=${approveRole[u.username] || 'user'} onChange=${e => setApproveRole({ ...approveRole, [u.username]: e.target.value })} className="p-2 border border-slate-300 rounded text-sm bg-white" title="Papel ao aprovar">
+                                                    <select value=${approveRole[u.username] || u.perfilSolicitado || 'user'} onChange=${e => setApproveRole({ ...approveRole, [u.username]: e.target.value })} className="p-2 border border-slate-300 rounded text-sm bg-white" title="Papel ao aprovar">
                                                         <option value="user">Usuário comum</option>
                                                         <option value="almoxarife">Almoxarife</option>
                                                         <option value="vendedor">Vendedor (Painel)</option>
@@ -9125,7 +9152,7 @@ HTML_PAGE = """
                                                         <option value="admin_master">Administrador Master (Painel)</option>
                                                         <option value="admin">Administrador</option>
                                                     </select>
-                                                    <button onClick=${() => callUserAction(u.username, 'approve', { body: { role: approveRole[u.username] || 'user', filialIds: approveFiliais[u.username] || u.filialIds || ['matriz'] } })} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium text-sm flex items-center gap-1"><i className="ph-bold ph-check"></i> Aprovar</button>
+                                                    <button onClick=${() => callUserAction(u.username, 'approve', { body: { role: approveRole[u.username] || u.perfilSolicitado || 'user', filialIds: approveFiliais[u.username] || u.filialIds || ['matriz'] } })} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium text-sm flex items-center gap-1"><i className="ph-bold ph-check"></i> Aprovar</button>
                                                     <button onClick=${() => handleDeleteUser(u.username)} className="bg-red-100 hover:bg-red-200 text-red-700 px-4 py-2 rounded font-medium text-sm flex items-center gap-1"><i className="ph-bold ph-x"></i> Rejeitar</button>
                                                 </div>
                                             </div>
