@@ -1727,28 +1727,7 @@ def omie_debug_listaros():
         return jsonify({"error": str(e)}), e.status
 
 
-# ===== CRM / Oportunidades — listar e puxar pro laudo =====
-# Fases do funil da conta BioDron (nCodFase → nome). Específico desta conta Omie.
-CRM_FASES = {
-    10843780550: "01 Em Análise",
-    10843780551: "02 Em Aprovação",
-    10843780552: "03 Em Preparação",
-    10843780553: "04 Finalizadas",
-    10843780554: "05 Pagos para envio",
-    10843780555: "06 Enviadas",
-}
-CRM_FASE_ANALISE = 10843780550
-CRM_FASE_APROVACAO = 10843780551
-CRM_FASE_PREPARACAO = 10843780552
-
-# Pra qual fase a oportunidade vai quando o técnico finaliza (gera OS+orçamento):
-# 01 Em Análise → 02 Em Aprovação ; 03 Em Preparação → 04 Finalizadas.
-CRM_FASE_DESTINO_FINALIZACAO = {
-    10843780550: 10843780551,
-    10843780552: 10843780553,
-}
-
-
+# ===== Anexos no Omie (o laudo vai SOMENTE na OS) =====
 def _incluir_anexo_omie(c_tabela, n_id, filename, tipo, arquivo_b64, md5, tag):
     """Inclui um anexo (já zipado+base64) em qualquer tabela do Omie (OS ou oportunidade).
     Lança OmieError em falha."""
@@ -1764,427 +1743,47 @@ def _incluir_anexo_omie(c_tabela, n_id, filename, tipo, arquivo_b64, md5, tag):
     })
 
 
-def _mover_fase_oportunidade(n_cod_op, nova_fase):
-    """Move uma oportunidade do CRM para outra fase. Lança OmieError em falha."""
-    return omie_call('/crm/oportunidades/', 'AlterarOportunidade', {
-        "identificacao": {"nCodOp": int(n_cod_op)},
-        "fasesStatus": {"nCodFase": int(nova_fase)}
-    })
-
-
-def _crm_parse_equipamento(c_des_op, c_obs):
-    """Extrai (serial, equipamento, defeito) da descrição/observações da oportunidade.
-    Prioriza marcadores estruturados do cObs; senão faz parsing heurístico do cDesOp.
-    Padrão comum do cDesOp: '<Nº Série> - <Equipamento> - <Defeito>'."""
-    c_des_op = (c_des_op or '').strip()
-    c_obs = (c_obs or '')
-    serial, equipamento, defeito = '', '', ''
-
-    # 1) cObs estruturado ("Modelo da Bateria: X ||Número de Série: Y||...")
-    if c_obs:
-        m_mod = re.search(r'Modelo[^:]*:\s*(.+?)\s*(?:\|\||$)', c_obs, re.IGNORECASE)
-        m_ser = re.search(r'N[úu]mero de S[ée]rie:\s*(.+?)\s*(?:\|\||$)', c_obs, re.IGNORECASE)
-        if m_mod:
-            equipamento = m_mod.group(1).strip()
-        if m_ser:
-            serial = m_ser.group(1).strip()
-
-    # 2) Parsing do cDesOp (Série - Equipamento - Defeito)
-    m = re.match(r'^\s*([A-Z0-9]{8,})\s*-\s*(.+?)\s*-\s*(.+)$', c_des_op)
-    if m:
-        if not serial:
-            serial = m.group(1).strip()
-        if not equipamento:
-            equipamento = m.group(2).strip()
-        defeito = m.group(3).strip()
-    else:
-        # Sem série detectável: tenta "Equipamento - Defeito"
-        partes = [p.strip() for p in re.split(r'\s+-\s+', c_des_op, maxsplit=1)]
-        if len(partes) == 2:
-            if not equipamento:
-                equipamento = partes[0]
-            defeito = partes[1]
-        else:
-            defeito = c_des_op
-
-    return serial, equipamento, defeito
-
-
-def _crm_resolver_conta(n_cod_conta):
-    """Consulta a Conta do CRM (nome, documento, contato). Retorna dict ou None."""
-    if not n_cod_conta:
-        return None
-    try:
-        data = omie_call('/crm/contas/', 'ConsultarConta', {"nCod": int(n_cod_conta)})
-    except OmieError:
-        return None
-    ident = data.get('identificacao', {}) or {}
-    tel = data.get('telefone_email', {}) or {}
-    return {
-        "nome": ident.get('cNome') or ident.get('cNomeFantasia') or '',
-        "doc": (ident.get('cDoc') or '').strip(),
-        "email": tel.get('cEmail') or '',
-        "phone": ((tel.get('cDDDTel') or '') + (tel.get('cNumTel') or '')).strip(),
-    }
-
-
-def _crm_buscar_cliente_faturamento(doc):
-    """Acha o cliente do cadastro de FATURAMENTO pelo CPF/CNPJ (pra criar OS/PV).
-    Retorna dict {omieClientId, name, document} ou None se não cadastrado."""
-    if not doc:
-        return None
-    doc_limpo = re.sub(r'\D', '', doc)
-    if not doc_limpo:
-        return None
-    try:
-        data = omie_call('/geral/clientes/', 'ListarClientes', {
-            "pagina": 1,
-            "registros_por_pagina": 5,
-            "apenas_importado_api": "N",
-            "clientesFiltro": {"cnpj_cpf": doc_limpo}
-        })
-    except (OmieError, OmieNoRecords):
-        return None
-    for c in data.get('clientes_cadastro', []):
-        return {
-            "omieClientId": c.get('codigo_cliente_omie'),
-            "name": c.get('razao_social') or c.get('nome_fantasia') or '',
-            "document": c.get('cnpj_cpf') or doc,
-        }
-    return None
-
-
-def _omie_oportunidades_da_fase(fase):
-    """Todos os cadastros de oportunidade de UMA fase — percorrendo TODAS as páginas.
-    Antes buscávamos só a página 1 (50 registros) e o resto era cortado calado: fases
-    com mais de 50 oportunidades apareciam truncadas (ex.: Aprovação parava em 50)."""
-    cadastros = []
-    pagina = 1
-    while True:
-        try:
-            data = omie_call('/crm/oportunidades/', 'ListarOportunidades', {
-                "pagina": pagina,
-                "registros_por_pagina": 100,
-                "fase": fase,
-            })
-        except OmieNoRecords:
-            break
-        lote = data.get('cadastros', []) or []
-        cadastros.extend(lote)
-        total_pag = int(data.get('total_de_paginas') or 1)
-        if pagina >= total_pag or not lote:
-            break
-        pagina += 1
-    return cadastros
-
-
-@app.route('/api/crm/oportunidades', methods=['GET'])
-def crm_listar_oportunidades():
-    """Lista oportunidades nas fases '01 Em Análise', '02 Em Aprovação' e '03 Em Preparação'.
-    Filtro ?fase= opcional (codigo). Não resolve a conta de cada uma (lento);
-    isso é feito ao puxar uma oportunidade específica."""
+@app.route('/api/faturamento/os/<path:os_num>/itens', methods=['GET'])
+def faturamento_itens_da_os(os_num):
+    """Peças e serviços que o técnico montou no Smart para a OS (nº da OS do Omie), já formatados para o ROBÔ
+    PREENCHER na própria OS (aba de serviços e Lista de Produtos). É só LEITURA — não cria nada no Omie.
+    Se houver mais de um rascunho para a mesma OS, usa o que tem mais itens (desempata pelo mais recente)."""
     user, full_data, err = _require_user()
     if err:
         return err
-    fase_arg = request.args.get('fase')
-    fases = [int(fase_arg)] if fase_arg else [CRM_FASE_ANALISE, CRM_FASE_APROVACAO, CRM_FASE_PREPARACAO]
-    items = []
-    erro = None
-    for fase in fases:
-        try:
-            cadastros = _omie_oportunidades_da_fase(fase)
-        except OmieError as e:
-            erro = str(e)
-            continue
-        for op in cadastros:
-            ident = op.get('identificacao', {}) or {}
-            fs = op.get('fasesStatus', {}) or {}
-            tk = op.get('ticket', {}) or {}
-            outras = op.get('outrasInf', {}) or {}
-            c_des = ident.get('cDesOp') or ''
-            c_obs = (op.get('observacoes') or {}).get('cObs') or ''
-            # extrai o Nº de Série (e equipamento) da descrição/observações pra busca —
-            # o serial às vezes só está no cObs estruturado, não na descrição visível.
-            serial, equipamento, _def = _crm_parse_equipamento(c_des, c_obs)
-            items.append({
-                "nCodOp": ident.get('nCodOp'),
-                "cNumOp": ident.get('cNumOp') or '',
-                "descricao": c_des,
-                "serial": serial,
-                "equipamento": equipamento,
-                "nCodConta": ident.get('nCodConta'),
-                "faseCodigo": fs.get('nCodFase'),
-                "faseNome": CRM_FASES.get(fs.get('nCodFase'), '—'),
-                "ticket": {
-                    "produtos": tk.get('nProdutos') or 0,
-                    "servicos": tk.get('nServicos') or 0,
-                    "total": tk.get('nTicket') or 0,
-                },
-                "dInclusao": outras.get('dInclusao') or '',
-            })
-    if erro and not items:
-        return jsonify({"error": erro}), 502
-    return jsonify({"items": items, "total": len(items)})
-
-
-@app.route('/api/crm/sync-fases', methods=['POST'])
-def crm_sync_fases():
-    """Sincroniza a fase CACHEADA de TODAS as OS do usuário com a fase ATUAL no Omie.
-    A equipe move as oportunidades no funil do Omie (ex.: Aprovação→Preparação), mas o
-    draft guarda a fase de quando foi criado — então a aba 'Serviços a executar' (que
-    filtra por fase) escondia oportunidades que já estavam em Preparação. Aqui puxamos as
-    fases do Omie em poucas chamadas (não uma por OS) e atualizamos os drafts que mudaram.
-    A fase certa também importa pro crm-finalizar mandar pra fase de destino correta."""
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    # Mapa: número/código da oportunidade -> fase atual no Omie (todas as fases do funil).
-    por_num, por_cod = {}, {}
-    try:
-        for fase in CRM_FASES:
-            for op in _omie_oportunidades_da_fase(fase):
-                ident = op.get('identificacao', {}) or {}
-                fs = op.get('fasesStatus', {}) or {}
-                f = fs.get('nCodFase') or fase
-                if ident.get('cNumOp'):
-                    por_num[str(ident['cNumOp'])] = f
-                if ident.get('nCodOp'):
-                    por_cod[int(ident['nCodOp'])] = f
-    except OmieError as e:
-        return jsonify({"error": f"Falha ao consultar o Omie: {e}"}), 502
-
-    # Itera as OS da FILIAL inteira (mesma fonte do GET /api/os) — não só as do usuário
-    # logado; senão as OS de outros técnicos ficavam com a fase velha e sumiam da bancada.
-    atualizadas = 0
-    for _owner, draft in _all_filial_drafts(full_data, user):
-        num = str(draft.get('crmOpNum') or '')
-        cod = draft.get('crmOpId')
-        nova = por_num.get(num)
-        if nova is None and cod is not None:
-            try:
-                nova = por_cod.get(int(cod))
-            except (TypeError, ValueError):
-                nova = None
-        if nova is not None and draft.get('crmFaseCodigo') != nova:
-            draft['crmFaseCodigo'] = nova
-            atualizadas += 1
-    if atualizadas:
-        save_data(full_data)
-    return jsonify({"success": True, "atualizadas": atualizadas})
-
-
-def _parse_omie_date(s):
-    """Converte data do Omie ('dd/mm/aaaa') em datetime. Retorna None se vazio/inválido."""
-    if not s or not isinstance(s, str):
-        return None
-    s = s.strip()
-    for fmt in ('%d/%m/%Y', '%d/%m/%y'):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-# Campos de data do fasesStatus (nomes padrão do funil Omie). Usados de forma
-# MAPPING-FREE: pegamos a MAIOR data (última transição), sem atribuir a uma fase
-# específica — porque o mapeamento campo↔fase ainda não foi confirmado com dados reais.
-FASES_DATE_FIELDS = ('dNovoLead', 'dQualificacao', 'dShowRoom', 'dTreinamento', 'dProjeto', 'dConclusao')
-
-
-@app.route('/api/admin/crm-tempo-fases', methods=['GET'])
-def crm_tempo_fases():
-    """Tempo nas fases (dashboard). Métrica INEQUÍVOCA: 'dias parados na fase atual'
-    = hoje − última transição (maior data do fasesStatus). A fase atual vem do nCodFase
-    (confiável). Também devolve as datas brutas pra confirmarmos o mapeamento campo↔fase
-    antes de calcular o histórico tempo-por-fase (que depende desse mapeamento)."""
-    user, full_data, err = _require_admin()
-    if err:
-        return err
-    hoje = datetime.now()
-    fases_alvo = [CRM_FASE_ANALISE, CRM_FASE_APROVACAO, CRM_FASE_PREPARACAO]
-    items = []
-    erro = None
-    for fase in fases_alvo:
-        try:
-            data = omie_call('/crm/oportunidades/', 'ListarOportunidades', {
-                "pagina": 1, "registros_por_pagina": 100, "fase": fase
-            })
-        except OmieNoRecords:
-            continue
-        except OmieError as e:
-            erro = str(e)
-            continue
-        for op in data.get('cadastros', []):
-            ident = op.get('identificacao', {}) or {}
-            fs = op.get('fasesStatus', {}) or {}
-            raw = {}
-            datas = []
-            for f in FASES_DATE_FIELDS:
-                val = fs.get(f)
-                d = _parse_omie_date(val)
-                if d:
-                    datas.append(d)
-                    raw[f] = val
-            entrada = max(datas) if datas else None
-            dias = (hoje - entrada).days if entrada else None
-            items.append({
-                "nCodOp": ident.get('nCodOp'),
-                "cNumOp": ident.get('cNumOp') or '',
-                "descricao": (ident.get('cDesOp') or '')[:90],
-                "faseCodigo": fs.get('nCodFase'),
-                "faseNome": CRM_FASES.get(fs.get('nCodFase'), '—'),
-                "entrada": entrada.strftime('%d/%m/%Y') if entrada else '',
-                "diasNaFase": dias,
-                "datasBrutas": raw,
-            })
-    # Agrega por fase atual (mapping-free).
-    por_fase = {}
-    for it in items:
-        fn = it['faseNome']
-        b = por_fase.setdefault(fn, {"fase": fn, "faseCodigo": it['faseCodigo'], "qtd": 0, "diasTotal": 0, "diasMax": 0, "comData": 0})
-        b["qtd"] += 1
-        if it['diasNaFase'] is not None:
-            b["diasTotal"] += it['diasNaFase']
-            b["comData"] += 1
-            b["diasMax"] = max(b["diasMax"], it['diasNaFase'])
-    resumo = []
-    for fn, v in por_fase.items():
-        media = round(v["diasTotal"] / v["comData"], 1) if v["comData"] else None
-        resumo.append({"fase": fn, "faseCodigo": v["faseCodigo"], "qtd": v["qtd"], "diasMedio": media, "diasMax": v["diasMax"]})
-    resumo.sort(key=lambda x: x["fase"])
-    items.sort(key=lambda x: (x["diasNaFase"] is None, -(x["diasNaFase"] or 0)))
-    return jsonify({"items": items, "resumo": resumo, "erro": erro})
-
-
-@app.route('/api/crm/oportunidade/<n_cod_op>', methods=['GET'])
-def crm_detalhe_oportunidade(n_cod_op):
-    """Consulta uma oportunidade e devolve dados prontos pra auto-preencher o laudo:
-    cliente (resolvido por documento), equipamento, série, defeito + cObs completo."""
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    try:
-        data = omie_call('/crm/oportunidades/', 'ConsultarOportunidade', {"nCodOp": int(n_cod_op)})
-    except OmieError as e:
-        return jsonify({"error": str(e)}), e.status
-
-    ident = data.get('identificacao', {}) or {}
-    fs = data.get('fasesStatus', {}) or {}
-    tk = data.get('ticket', {}) or {}
-    obs = (data.get('observacoes', {}) or {}).get('cObs', '') or ''
-    c_des_op = ident.get('cDesOp') or ''
-
-    conta = _crm_resolver_conta(ident.get('nCodConta'))
-    cliente_fat = _crm_buscar_cliente_faturamento(conta['doc']) if conta else None
-    serial, equipamento, defeito = _crm_parse_equipamento(c_des_op, obs)
-
-    # cObs vem com '||' e '|' como quebras de linha — normaliza pra leitura
-    obs_legivel = obs.replace('||', '\n').replace('|', '\n').strip()
-
-    return jsonify({
-        "nCodOp": ident.get('nCodOp'),
-        "cNumOp": ident.get('cNumOp') or '',
-        "faseCodigo": fs.get('nCodFase'),
-        "faseNome": CRM_FASES.get(fs.get('nCodFase'), '—'),
-        "ticket": {
-            "produtos": tk.get('nProdutos') or 0,
-            "servicos": tk.get('nServicos') or 0,
-            "total": tk.get('nTicket') or 0,
-        },
-        "conta": conta,
-        "cliente": cliente_fat,  # null se não tiver cadastro de faturamento
-        "laudo": {
-            "client": (cliente_fat or {}).get('name') or (conta or {}).get('nome') or '',
-            "model": equipamento,
-            "serial": serial,
-            "defect": defeito,
-        },
-        "descricao": c_des_op,
-        "observacoes": obs_legivel,
-    })
-
-
-@app.route('/api/crm/oportunidade/<n_cod_op>/mover-fase', methods=['POST'])
-def crm_mover_fase(n_cod_op):
-    """Move uma oportunidade pra uma fase escolhida (uso manual, ex: reverter um teste).
-    Body: {nCodFase}. Valida que a fase existe no funil."""
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    body = request.json or {}
-    nova_fase = body.get('nCodFase')
-    try:
-        nova_fase = int(nova_fase)
-    except (TypeError, ValueError):
-        return jsonify({"error": "nCodFase inválido"}), 400
-    if nova_fase not in CRM_FASES:
-        return jsonify({"error": "Fase desconhecida"}), 400
-    try:
-        _mover_fase_oportunidade(n_cod_op, nova_fase)
-        return jsonify({"success": True, "faseNome": CRM_FASES.get(nova_fase, '')})
-    except OmieError as e:
-        return jsonify({"error": str(e)}), e.status
-
-
-@app.route('/api/crm/oportunidade/<path:crm_op>/itens-faturamento', methods=['GET'])
-def crm_itens_faturamento(crm_op):
-    """Itens (produtos + serviços) que o técnico montou no Smart Report para uma
-    oportunidade, já formatados para o Power Automate Desktop DIGITAR no Ticket do CRM
-    ('Produtos/Serviços associados à Oportunidade') e em seguida faturar nativamente.
-
-    Localiza o rascunho de OS da filial pela crmOpNum (ex.: '2026/00194') OU pelo
-    crmOpId. É só LEITURA — não cria nada no Omie (o PAD faz o faturamento na tela).
-    """
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    alvo = str(crm_op).strip()
-    # Pode haver VÁRIOS drafts pra mesma oportunidade (ex.: um 'sent' com itens + um
-    # rascunho vazio). Pega o que tem MAIS itens (produtos+serviços); desempata pelo
-    # mais recente (updatedAt). Assim o PAD nunca recebe a OS vazia por engano.
-    candidatos = [
-        d for owner, d in _all_filial_drafts(full_data, user)
-        if str(d.get('crmOpNum') or '').strip() == alvo or str(d.get('crmOpId') or '').strip() == alvo
-    ]
+    alvo = str(os_num).strip()
+    candidatos = [d for _o, d in _all_filial_drafts(full_data, user) if str(d.get('omieOsNumber') or '').strip() == alvo]
     if not candidatos:
-        return jsonify({"error": "Nenhuma OS do Smart Report vinculada a essa oportunidade."}), 404
-    draft = max(candidatos, key=lambda d: (
-        len(d.get('parts') or []) + len(d.get('services') or []),
-        d.get('updatedAt') or '',
-    ))
+        return jsonify({"error": "Nenhuma OS do Smart Report com esse número."}), 404
+    draft = max(candidatos, key=lambda d: (len(d.get('parts') or []) + len(d.get('services') or []), d.get('updatedAt') or ''))
 
-    produtos = []
-    for p in (draft.get('parts') or []):
-        produtos.append({
-            "codigo": p.get('code') or '',
-            "descricao": p.get('description') or '',
-            "quantidade": float(p.get('quantity') or 1),
-            "valorUnitario": float(p.get('unitPrice') or 0),
-            "omieProductId": p.get('omieProductId'),
-        })
-    servicos = []
-    for s in (draft.get('services') or []):
-        servicos.append({
-            "codigo": s.get('code') or '',
-            "descricao": s.get('description') or '',
-            "quantidade": float(s.get('quantity') or 1),
-            "valorUnitario": float(s.get('unitPrice') or 0),
-        })
+    produtos = [{
+        "codigo": p.get('code') or '',
+        "descricao": p.get('description') or '',
+        "quantidade": float(p.get('quantity') or 1),
+        "valorUnitario": float(p.get('unitPrice') or 0),
+        "omieProductId": p.get('omieProductId'),
+    } for p in (draft.get('parts') or [])]
+    servicos = [{
+        "codigo": s_.get('code') or '',
+        "descricao": s_.get('description') or '',
+        "quantidade": float(s_.get('quantity') or 1),
+        "valorUnitario": float(s_.get('unitPrice') or 0),
+    } for s_ in (draft.get('services') or [])]
     return jsonify({
-        "crmOpNum": draft.get('crmOpNum'),
-        "crmOpId": draft.get('crmOpId'),
+        "osNum": draft.get('omieOsNumber'),
+        "osOmieId": draft.get('omieOsId'),
         "osId": draft.get('id'),
         "cliente": (draft.get('client') or {}).get('name') or '',
         "documentoCliente": (draft.get('client') or {}).get('document') or '',
+        "observacoes": draft.get('observations') or '',
         "produtos": produtos,
         "servicos": servicos,
         "qtdProdutos": len(produtos),
         "qtdServicos": len(servicos),
         "totalProdutos": round(sum(p['quantidade'] * p['valorUnitario'] for p in produtos), 2),
-        "totalServicos": round(sum(s['quantidade'] * s['valorUnitario'] for s in servicos), 2),
-        # quando True, a OS foi CORRIGIDA -> o robô deve EXCLUIR os PV/OS antigos (abertos)
-        # e REGERAR com estes itens, em vez de pular por já existirem.
+        "totalServicos": round(sum(x['quantidade'] * x['valorUnitario'] for x in servicos), 2),
+        # quando True, a OS foi CORRIGIDA -> o robô deve refazer o preenchimento com estes itens
         "refaturar": bool(draft.get('refaturar')),
     })
 
@@ -2200,10 +1799,10 @@ def faturamento_pendentes():
     pend = []
     for owner, d in _all_filial_drafts(full_data, user):
         if (d.get('faturadoPeloRobo') and not d.get('roboFaturadoAt')
-                and d.get('crmOpNum') and (d.get('parts') or d.get('services'))):
+                and d.get('omieOsNumber') and (d.get('parts') or d.get('services'))):
             pend.append({
                 "osId": d.get('id'),
-                "crmOpNum": d.get('crmOpNum'),
+                "osNum": str(d.get('omieOsNumber')),
                 "cliente": (d.get('client') or {}).get('name') or '',
                 "qtdProdutos": len(d.get('parts') or []),
                 "qtdServicos": len(d.get('services') or []),
@@ -2222,14 +1821,14 @@ def faturamento_painel():
         return err
     pend, recentes = [], []
     for owner, d in _all_filial_drafts(full_data, user):
-        if not d.get('crmOpNum'):
+        if not d.get('omieOsNumber'):
             continue
         nome = _html.unescape((d.get('client') or {}).get('name') or '')
         if (d.get('faturadoPeloRobo') and not d.get('roboFaturadoAt')
                 and (d.get('parts') or d.get('services'))):
             pend.append({
                 "osId": d.get('id'),
-                "crmOpNum": d.get('crmOpNum'),
+                "osNum": str(d.get('omieOsNumber')),
                 "cliente": nome,
                 "qtdProdutos": len(d.get('parts') or []),
                 "qtdServicos": len(d.get('services') or []),
@@ -2237,7 +1836,7 @@ def faturamento_painel():
             })
         elif d.get('roboFaturadoAt'):
             recentes.append({
-                "crmOpNum": d.get('crmOpNum'),
+                "osNum": str(d.get('omieOsNumber')),
                 "cliente": nome,
                 "roboFaturadoAt": d.get('roboFaturadoAt'),
                 "roboPV": d.get('roboPV'),
@@ -2461,22 +2060,14 @@ def omie_os_consulta(nCodOS):
         return jsonify({"error": str(e)}), e.status
 
 
-@app.route('/api/os/importar-omie', methods=['POST'])
-def os_importar_omie():
-    """Importa uma OS do Omie como rascunho local (pra editar e depois salvar de volta com AlterarOS)."""
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    body = request.json or {}
-    nCodOS = body.get('nCodOS')
-    if not nCodOS:
-        return jsonify({"error": "nCodOS obrigatório"}), 400
-
+def _importar_os_omie(full_data, user, nCodOS):
+    """Importa uma OS do Omie como rascunho local (pra editar e depois salvar de volta com AlterarOS).
+    Devolve (draft, None) ou (None, (resposta_json, status)). Se já existe rascunho da OS na filial, devolve ele."""
     # Consulta no Omie
     try:
         data = omie_call('/servicos/os/', 'ConsultarOS', {"nCodOS": int(nCodOS)})
     except OmieError as e:
-        return jsonify({"error": str(e)}), e.status
+        return None, (jsonify({"error": str(e)}), e.status)
 
     cab = data.get('Cabecalho') or {}
     info = data.get('InformacoesAdicionais') or {}
@@ -2486,7 +2077,7 @@ def os_importar_omie():
     # Verifica se já tem rascunho linkado a essa OS em qualquer usuário da filial
     existing = next((d for _o, d in _all_filial_drafts(full_data, user) if d.get('omieOsId') == cab.get('nCodOS')), None)
     if existing:
-        return jsonify(existing)
+        return existing, None
     drafts = _user_drafts(full_data, user)  # importa para o próprio usuário
 
     client_name = ''
@@ -2555,7 +2146,131 @@ def os_importar_omie():
     }
     drafts.append(draft)
     save_data(full_data)
-    return jsonify(draft)
+    return draft, None
+
+
+@app.route('/api/os/importar-omie', methods=['POST'])
+def os_importar_omie():
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    nCodOS = (request.json or {}).get('nCodOS')
+    if not nCodOS:
+        return jsonify({"error": "nCodOS obrigatório"}), 400
+    draft, erro = _importar_os_omie(full_data, user, nCodOS)
+    return erro if erro else jsonify(draft)
+
+
+def _omie_os_indice(forcar=False):
+    """Número da OS (cNumOS) -> {nCodOS, cEtapa}, varrendo ListarOS (em cache). O número é o que o vendedor
+    digita no cartão do painel; o Omie não filtra por ele de forma confiável, então indexamos tudo."""
+    ck = 'os_indice_numero'
+    if not forcar:
+        hit = _cache_get(ck)
+        if hit is not None:
+            return hit
+    idx, pagina = {}, 1
+    while True:
+        try:
+            resp = omie_call('/servicos/os/', 'ListarOS', {"pagina": pagina, "registros_por_pagina": 50,
+                                                           "apenas_importado_api": "N"}, timeout=40)
+        except OmieNoRecords:
+            break
+        for o in resp.get('osCadastro') or []:
+            cab = o.get('Cabecalho') or {}
+            n = str(cab.get('cNumOS') or '').strip()
+            if n:
+                idx[n] = {"nCodOS": cab.get('nCodOS'), "cEtapa": cab.get('cEtapa') or ''}
+        if pagina >= int(resp.get('total_de_paginas') or 1):
+            break
+        pagina += 1
+    _cache_set(ck, idx)
+    return idx
+
+
+def _omie_os_por_numero(num):
+    num = str(num or '').strip()
+    idx = _omie_os_indice()
+    if num not in idx:
+        idx = _omie_os_indice(forcar=True)   # OS recém-criada no Omie
+    return idx.get(num)
+
+
+@app.route('/api/omie/os/por-numero/<num>', methods=['GET'])
+def omie_os_por_numero(num):
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    try:
+        achou = _omie_os_por_numero(num)
+    except OmieError as e:
+        return jsonify({"error": str(e)}), e.status
+    if not achou:
+        return jsonify({"error": f"OS {num} não encontrada no Omie."}), 404
+    return jsonify({"cNumOS": str(num).strip(), **achou})
+
+
+@app.route('/api/os/laudo-da-os/<num>', methods=['GET'])
+def os_laudo_da_os(num):
+    """Dados para PRÉ-PREENCHER o laudo a partir da OS do Omie (nº digitado no cartão do painel):
+    cliente, equipamento/série (do cartão) e defeito (da observação da OS). Só leitura."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    num = str(num).strip()
+    try:
+        achou = _omie_os_por_numero(num)
+        if not achou:
+            return jsonify({"error": f"OS {num} não encontrada no Omie."}), 404
+        os_omie = omie_call('/servicos/os/', 'ConsultarOS', {"nCodOS": int(achou['nCodOS'])})
+        cab = os_omie.get('Cabecalho') or {}
+        obs = ((os_omie.get('InformacoesAdicionais') or {}).get('cDadosAdicNF') or '')
+        nome, doc = '', ''
+        if cab.get('nCodCli'):
+            try:
+                cli = omie_call('/geral/clientes/', 'ConsultarCliente', {"codigo_cliente_omie": cab['nCodCli']})
+                nome = cli.get('razao_social') or cli.get('nome_fantasia') or ''
+                doc = cli.get('cnpj_cpf') or ''
+            except OmieError:
+                pass
+    except OmieError as e:
+        return jsonify({"error": str(e)}), e.status
+    cartao = _painel_cartao_da_os(full_data, num) or {}
+    m = re.search(r'Defeito[^:|]*:\s*([^|]+)', obs, re.IGNORECASE)
+    return jsonify({
+        "omieOsId": achou['nCodOS'], "omieOsNumber": num, "cEtapa": achou.get('cEtapa') or '',
+        "cliente": {"omieClientId": cab.get('nCodCli'), "name": nome, "document": doc},
+        "laudo": {
+            "client": cartao.get('cliente') or nome,
+            "model": ' '.join(x for x in (cartao.get('equipamento'), cartao.get('modelo')) if x),
+            "serial": cartao.get('serie') or '',
+            "defect": (m.group(1).strip() if m else ''),
+        },
+        "descricao": obs,
+        "noPainel": bool(cartao),
+    })
+
+
+@app.route('/api/os/abrir-por-numero', methods=['POST'])
+def os_abrir_por_numero():
+    """Traz para o Smart a OS do Omie cujo número está no cartão do painel (cria o rascunho, ou devolve o que já existe)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    num = str((request.json or {}).get('numero') or '').strip()
+    if not num:
+        return jsonify({"error": "Informe o número da OS."}), 400
+    existente = next((d for _o, d in _all_filial_drafts(full_data, user) if str(d.get('omieOsNumber') or '').strip() == num), None)
+    if existente:
+        return jsonify(_strip_part_photos(existente))
+    try:
+        achou = _omie_os_por_numero(num)
+    except OmieError as e:
+        return jsonify({"error": str(e)}), e.status
+    if not achou:
+        return jsonify({"error": f"OS {num} não encontrada no Omie."}), 404
+    draft, erro = _importar_os_omie(full_data, user, achou['nCodOS'])
+    return erro if erro else jsonify(_strip_part_photos(draft))
 
 
 @app.route('/api/omie/cache/clear', methods=['POST'])
@@ -2976,6 +2691,35 @@ def _painel_ordem_view(p, o, com_valor):
 
 def _painel_bump(p):
     p['rev'] = int(p.get('rev') or 0) + 1
+
+
+PAINEL_DATA_DO_DESTINO = {"aprov": "dAnalise", "exec": "dExecucao", "teste": "dTeste", "final": "dFinalizado"}
+
+
+def _painel_cartao_da_os(full_data, os_num):
+    num = str(os_num or '').strip()
+    if not num:
+        return None
+    cands = [o for o in _painel_estado(full_data)['ordens'].values() if str(o.get('os') or '').strip() == num]
+    return max(cands, key=lambda o: o.get('criadoEm') or '') if cands else None
+
+
+def _painel_mover_por_os(full_data, os_num, destino, user):
+    """Move o cartão do painel que tem este nº de OS (fluxo do técnico). Devolve o cartão ou None.
+    Não tira OS de Enviados/Condenados e preenche a data da etapa se estiver vazia."""
+    o = _painel_cartao_da_os(full_data, os_num)
+    if not o or o.get('col') in ('enviado', 'condenado') or o.get('col') == destino:
+        return o
+    campo = PAINEL_DATA_DO_DESTINO.get(destino)
+    if campo and not o.get(campo):
+        o[campo] = datetime.now().strftime('%Y-%m-%d')
+    if destino == 'aprov' and not o.get('tecnico'):
+        o['tecnico'] = _responsavel_nome(full_data, user)
+    o['col'] = destino
+    o['atualizadoEm'] = datetime.utcnow().isoformat() + "Z"
+    o['atualizadoPor'] = user
+    _painel_bump(_painel_estado(full_data))
+    return o
 
 
 @app.route('/painel/')
@@ -3449,23 +3193,6 @@ def _strip_part_photos(draft):
     return {**draft, 'parts': novas} if pesado else draft
 
 
-def _nome_conta_crm(n_cod_conta):
-    """Nome do CLIENTE da oportunidade (Conta do CRM), com cache.
-
-    Antes a bancada usava `cDesOp.split(' - ')[0]` como "cliente" — mas o título da
-    oportunidade é "SERIE - EQUIPAMENTO - SERVIÇO" (ex.: "64TBL61002001V - DRONE T40 -
-    REVISÃO GERAL"), então o técnico via o NÚMERO DE SÉRIE no lugar do nome do cliente."""
-    if not n_cod_conta:
-        return ''
-    ck = f"crm_conta_nome_{n_cod_conta}"
-    v = _cache_get(ck)
-    if v is None:
-        conta = _crm_resolver_conta(n_cod_conta)
-        v = (conta or {}).get('nome') or '—'
-        _cache_set(ck, v)
-    return '' if v == '—' else v
-
-
 def _resumo_laudo(full_data, owner, draft):
     """Parecer técnico da IA (o que fazer no equipamento) pra mostrar na bancada.
     Preferência: o texto capturado na própria OS (fromLaudo.laudoTecnico, nas OS novas);
@@ -3482,26 +3209,56 @@ def _resumo_laudo(full_data, owner, draft):
     return ''
 
 
-@app.route('/api/os/bancada', methods=['GET'])
-def os_bancada():
-    """Bancada 'Serviços a executar', guiada pela verdade do OMIE (não pelo cache).
-
-    Puxa as oportunidades que ESTÃO em '03 Em Preparação' no Omie AGORA e, para cada uma,
-    liga a MELHOR OS do app (a mais recente que ainda está na bancada). Uma linha por
-    oportunidade — sem duplicatas (havia op com 11 OS de sobra dos testes) e sem OS velhas
-    cuja oportunidade já saiu de Preparação. Deixa a fase cacheada da OS escolhida correta
-    (Preparação), pra o 'Aprovar e liberar' mandar pra fase de destino certa depois."""
+@app.route('/api/pecas/buscar-serial', methods=['GET'])
+def buscar_serial():
+    """Rastreabilidade: busca um nº de série de peça (velha ou nova) em TODAS as OS
+    da filial. Usado pra checar, numa reclamação de garantia, em qual manutenção a
+    peça foi instalada/retirada."""
     user, full_data, err = _require_user()
     if err:
         return err
-    try:
-        ops = _omie_oportunidades_da_fase(CRM_FASE_PREPARACAO)
-    except OmieError as e:
-        return jsonify({"error": f"Falha ao consultar o Omie: {e}"}), 502
+    termo = (request.args.get('serial') or '').strip().lower()
+    if len(termo) < 3:
+        return jsonify({"error": "Informe ao menos 3 caracteres do número de série."}), 400
+    resultados = []
+    for owner, d in _all_filial_drafts(full_data, user):
+        for p in (d.get('parts') or []):
+            sa = (p.get('serialAntigo') or '').strip()
+            sn = (p.get('serialNovo') or '').strip()
+            achou = []
+            if sa and termo in sa.lower():
+                achou.append(('retirada', sa))
+            if sn and termo in sn.lower():
+                achou.append(('instalada', sn))
+            for papel, serial in achou:
+                resultados.append({
+                    "papel": papel,  # 'instalada' (peça nova) ou 'retirada' (peça velha)
+                    "serial": serial,
+                    "peca": p.get('description') or p.get('code') or '—',
+                    "osNumero": d.get('omieOsNumber') or '—',
+                    "osId": d.get('id'),
+                    "crmOpNum": d.get('crmOpNum') or '',
+                    "cliente": (d.get('client') or {}).get('name') or '—',
+                    "data": d.get('sentAt') or d.get('updatedAt') or d.get('createdAt') or '',
+                    "responsavel": _responsavel_nome(full_data, owner),
+                })
+    return jsonify({"resultados": resultados, "total": len(resultados)})
+
+
+@app.route('/api/os/bancada', methods=['GET'])
+def os_bancada():
+    """Bancada 'Serviços a executar', guiada pelo PAINEL DE MANUTENÇÃO: os cartões em 'Fila de Manutenção' e
+    'Em Execução'. Cada cartão aponta a OS pelo número (campo OS); se a OS já foi trazida do Omie para o Smart
+    (rascunho com esse omieOsNumber) ela vem junto; senão a tela oferece 'Abrir OS'. Uma linha por cartão."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    cartoes = [o for o in p['ordens'].values() if o.get('col') in ('fila', 'exec')]
 
     por_num = {}
     for owner, d in _all_filial_drafts(full_data, user):
-        n = str(d.get('crmOpNum') or '')
+        n = str(d.get('omieOsNumber') or '').strip()
         if n:
             por_num.setdefault(n, []).append((owner, d))
 
@@ -3509,49 +3266,32 @@ def os_bancada():
         return (d.get('execEstado') or 'a_executar') in ('a_executar', 'reprovado')
 
     saida = []
-    tocou = False
-    for op in ops:
-        ident = op.get('identificacao', {}) or {}
-        num = str(ident.get('cNumOp') or '')
-        c_des = ident.get('cDesOp') or ''
-        c_obs = (op.get('observacoes') or {}).get('cObs') or ''
-        _serial, equipamento, _def = _crm_parse_equipamento(c_des, c_obs)
-        candidatos = por_num.get(num, [])  # [(owner, draft)]
-        # escolhe a OS ATIVA mais recente; se nenhuma ativa, a mais recente (só p/ referência)
-        ativos = [(o, d) for o, d in candidatos if _ativa(d)]
+    for o in sorted(cartoes, key=lambda c: (c.get('col') != 'exec', c.get('dAprovacao') or c.get('dChegada') or '', c['id'])):
+        num = str(o.get('os') or '').strip()
+        candidatos = por_num.get(num, []) if num else []
+        ativos = [(ow, d) for ow, d in candidatos if _ativa(d)]
         escolha_owner, escolha = None, None
         if ativos:
             escolha_owner, escolha = max(ativos, key=lambda od: od[1].get('createdAt') or '')
         elif candidatos and any((d.get('execEstado') or 'a_executar') in ('aguardando_teste', 'aprovado') for _o, d in candidatos):
-            # já foi pro teste/liberação -> some da bancada
-            continue
-        # CLIENTE de verdade: Conta do CRM da oportunidade. Cai pro cliente da OS do app
-        # e, em último caso, pro 1º pedaço do título (que costuma ser o nº de série).
-        cliente_nome = _nome_conta_crm(ident.get('nCodConta'))
-        if not cliente_nome and escolha is not None:
-            cliente_nome = ((escolha.get('client') or {}).get('name') or '').strip()
+            continue   # já foi pro teste/liberação -> some da bancada
+        equip = ' '.join(x for x in (o.get('equipamento'), o.get('modelo')) if x)
         entry = {
-            "crmOpNum": num,
-            "cliente": cliente_nome or (c_des.split(' - ')[0] if ' - ' in c_des else (c_des or 'Sem cliente')),
-            "equipamento": equipamento or '',
-            "serie": _serial or '',
-            "descricao": c_des,
+            "painelId": o['id'], "painelCol": o.get('col'),
+            "crmOpNum": num, "osNum": num,
+            "cliente": o.get('cliente') or (((escolha or {}).get('client') or {}).get('name') or '') or 'Sem cliente',
+            "equipamento": equip, "serie": o.get('serie') or '',
+            "descricao": equip,
         }
         if escolha is not None:
-            if escolha.get('crmFaseCodigo') != CRM_FASE_PREPARACAO:
-                escolha['crmFaseCodigo'] = CRM_FASE_PREPARACAO
-                tocou = True
             entry["osId"] = escolha.get('id')
             entry["os"] = _strip_part_photos(escolha)
-            # Resumo do que fazer = parecer da IA (laudoTecnico), pro técnico ver na bancada.
             entry["resumo"] = _resumo_laudo(full_data, escolha_owner, escolha)
         else:
             entry["osId"] = None
             entry["os"] = None
             entry["resumo"] = ''
         saida.append(entry)
-    if tocou:
-        save_data(full_data)
     return jsonify({"items": saida, "total": len(saida)})
 
 
@@ -3563,8 +3303,10 @@ def os_list():
     # Painel compartilhado: todas as OS da filial, com nome de quem preencheu.
     # Lista ENXUTA: sem as fotos base64 das peças (vêm no GET /api/os/<id> ao abrir).
     out = []
+    col_por_os = {str(o.get('os') or '').strip(): o.get('col') for o in _painel_estado(full_data)['ordens'].values() if o.get('os')}
     for owner, d in _all_filial_drafts(full_data, user):
-        out.append({**_strip_part_photos(d), "responsavel": _responsavel_nome(full_data, d.get('createdBy') or owner)})
+        out.append({**_strip_part_photos(d), "responsavel": _responsavel_nome(full_data, d.get('createdBy') or owner),
+                    "painelCol": col_por_os.get(str(d.get('omieOsNumber') or '').strip())})
     # Ordena por data de criação (mais recente primeiro)
     out.sort(key=lambda x: x.get('createdAt') or '', reverse=True)
     return jsonify(out)
@@ -3600,13 +3342,10 @@ def os_create():
         "parts": body.get('parts') or [],
         "observations": body.get('observations') or '',
         "status": "draft",
-        "omieOsId": None,
-        "omieOsNumber": None,
+        "omieOsId": body.get('omieOsId') or None,
+        "omieOsNumber": (str(body.get('omieOsNumber')).strip() if body.get('omieOsNumber') else None),
         "sentAt": None,
         "sendError": None,
-        "crmOpId": body.get('crmOpId') or None,
-        "crmOpNum": body.get('crmOpNum') or None,
-        "crmFaseCodigo": body.get('crmFaseCodigo') or None,
         "laudoId": body.get('laudoId') or None,
         "garantiaStatus": body.get('garantiaStatus') or 'avulsa',
         "garantiaMotivo": body.get('garantiaMotivo') or '',
@@ -3676,8 +3415,8 @@ def os_corrigir(os_id):
     owner, draft = _find_filial_draft(full_data, user, os_id)
     if not draft:
         return jsonify({"error": "OS não encontrada"}), 404
-    if not draft.get('crmOpNum'):
-        return jsonify({"error": "OS sem oportunidade vinculada — o robô não consegue refaturar."}), 400
+    if not draft.get('omieOsNumber'):
+        return jsonify({"error": "OS sem número do Omie — o robô não consegue preencher."}), 400
     body = request.json or {}
     for k in ('client', 'services', 'parts', 'observations'):
         if k in body:
@@ -3785,69 +3524,11 @@ def os_execucao(os_id):
     elif estado in ('aprovado', 'reprovado'):
         draft['execTestadoAt'] = now
     draft['updatedAt'] = now
+    # Painel de Manutenção: acompanha o estado da execução/teste
+    _painel_mover_por_os(full_data, draft.get('omieOsNumber'),
+                         {'a_executar': 'exec', 'reprovado': 'exec', 'aguardando_teste': 'teste', 'aprovado': 'final'}[estado], user)
     save_data(full_data)
     return jsonify(draft)
-
-
-@app.route('/api/os/<os_id>/sync-crm-fase', methods=['POST'])
-def os_sync_crm_fase(os_id):
-    """Sincroniza a fase do CRM cacheada no draft com a fase ATUAL da oportunidade.
-    A equipe move a oportunidade no Omie (ex.: Análise→Preparação); o draft precisa
-    refletir isso para o painel de Execução e o destino da finalização. Funciona em
-    OS já enviada (não passa pelo bloqueio do os_update)."""
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    owner, draft = _find_filial_draft(full_data, user, os_id)
-    if not draft:
-        return jsonify({"error": "OS não encontrada"}), 404
-    body = request.json or {}
-    try:
-        fase = int(body.get('crmFaseCodigo'))
-    except (TypeError, ValueError):
-        return jsonify({"error": "crmFaseCodigo inválido."}), 400
-    if fase not in CRM_FASES:
-        return jsonify({"error": "Fase desconhecida."}), 400
-    draft['crmFaseCodigo'] = fase
-    draft['updatedAt'] = datetime.utcnow().isoformat() + "Z"
-    save_data(full_data)
-    return jsonify(draft)
-
-
-@app.route('/api/pecas/buscar-serial', methods=['GET'])
-def buscar_serial():
-    """Rastreabilidade: busca um nº de série de peça (velha ou nova) em TODAS as OS
-    da filial. Usado pra checar, numa reclamação de garantia, em qual manutenção a
-    peça foi instalada/retirada."""
-    user, full_data, err = _require_user()
-    if err:
-        return err
-    termo = (request.args.get('serial') or '').strip().lower()
-    if len(termo) < 3:
-        return jsonify({"error": "Informe ao menos 3 caracteres do número de série."}), 400
-    resultados = []
-    for owner, d in _all_filial_drafts(full_data, user):
-        for p in (d.get('parts') or []):
-            sa = (p.get('serialAntigo') or '').strip()
-            sn = (p.get('serialNovo') or '').strip()
-            achou = []
-            if sa and termo in sa.lower():
-                achou.append(('retirada', sa))
-            if sn and termo in sn.lower():
-                achou.append(('instalada', sn))
-            for papel, serial in achou:
-                resultados.append({
-                    "papel": papel,  # 'instalada' (peça nova) ou 'retirada' (peça velha)
-                    "serial": serial,
-                    "peca": p.get('description') or p.get('code') or '—',
-                    "osNumero": d.get('omieOsNumber') or '—',
-                    "osId": d.get('id'),
-                    "crmOpNum": d.get('crmOpNum') or '',
-                    "cliente": (d.get('client') or {}).get('name') or '—',
-                    "data": d.get('sentAt') or d.get('updatedAt') or d.get('createdAt') or '',
-                    "responsavel": _responsavel_nome(full_data, owner),
-                })
-    return jsonify({"resultados": resultados, "total": len(resultados)})
 
 
 @app.route('/api/os/<os_id>', methods=['DELETE'])
@@ -5112,19 +4793,9 @@ def os_gerar_pdf_anexar(os_id):
                 })
             except OmieError as e:
                 return jsonify({"error": str(e)}), e.status
-        if draft.get('crmOpId'):
-            try:
-                _incluir_anexo_omie('crm-oportunidades', draft['crmOpId'], fn, 'pdf', b64, md5h, 'op' + secrets.token_hex(2))
-            except OmieError as e:
-                # Sem OS, a oportunidade é o único destino -> erro é fatal.
-                if not draft.get('omieOsId'):
-                    return jsonify({"error": f"Falha ao anexar o laudo na oportunidade: {e}"}), e.status
-                draft['crmAnexoWarning'] = f"PDF anexado na OS, mas falhou na oportunidade: {e}"
 
     draft['pdfAnexado'] = True
     draft['pdfAnexadoAt'] = datetime.utcnow().isoformat() + "Z"
-    if draft.get('crmOpId'):
-        draft['pdfAnexadoOp'] = True
 
     save_data(full_data)
     return jsonify({"success": True})
@@ -5270,16 +4941,6 @@ def os_anexar_fotos(os_id):
         except OmieError as e:
             return jsonify({"error": str(e)}), e.status
 
-    # Anexa as fotos NA OPORTUNIDADE do CRM (sempre que houver). Sem OS, é o único destino.
-    if draft.get('crmOpId'):
-        try:
-            _incluir_anexo_omie('crm-oportunidades', draft['crmOpId'], filename, 'zip', outer_b64, md5_hash, 'fop')
-            draft['fotosAnexadasOp'] = True
-        except OmieError as e:
-            if not draft.get('omieOsId'):
-                return jsonify({"error": f"Falha ao anexar fotos na oportunidade: {e}"}), e.status
-            draft['crmAnexoWarning'] = f"Fotos anexadas na OS, mas falhou na oportunidade: {e}"
-
     draft['fotosAnexadas'] = True
     draft['fotosAnexadasAt'] = datetime.utcnow().isoformat() + "Z"
     draft['fotosCount'] = fotos_count
@@ -5287,82 +4948,34 @@ def os_anexar_fotos(os_id):
     return jsonify({"success": True, "count": fotos_count})
 
 
-@app.route('/api/os/<os_id>/crm-finalizar', methods=['POST'])
-def os_crm_finalizar(os_id):
-    """Finaliza o vínculo com a oportunidade do CRM: move a fase (Análise→Aprovação,
-    Preparação→Finalizadas) e devolve os números de Oportunidade, OS e PV."""
+@app.route('/api/os/<os_id>/painel-finalizar', methods=['POST'])
+def os_painel_finalizar(os_id):
+    """Conclui a etapa do técnico movendo o CARTÃO do painel (achado pelo nº da OS):
+    laudo enviado na análise -> Aguardando Aprovação; teste aprovado -> Finalizado.
+    A etapa da OS no Omie continua sendo manual."""
     user, full_data, err = _require_user()
     if err:
         return err
     owner, draft = _find_filial_draft(full_data, user, os_id)
     if not draft:
         return jsonify({"error": "Rascunho não encontrado"}), 404
-    if not draft.get('crmOpId'):
-        return jsonify({"error": "Esta OS não está vinculada a uma oportunidade do CRM."}), 400
-
-    fase_atual = draft.get('crmFaseCodigo')
-    nova_fase = CRM_FASE_DESTINO_FINALIZACAO.get(fase_atual)
-    fase_movida = False
-    fase_warning = None
-
-    # TRAVA: Preparação→Finalizadas exige o teste do equipamento APROVADO.
-    if fase_atual == CRM_FASE_PREPARACAO and (draft.get('execEstado') != 'aprovado'):
-        return jsonify({"error": "Para enviar para Finalizadas, marque o teste do equipamento como APROVADO no painel de Execução & Teste da OS."}), 400
-
-    # Monta a referência cruzada (OS + PV) pra registrar nas observações da oportunidade.
-    os_num = draft.get('omieOsNumber') or '—'
-    pv_num = draft.get('pedidoVendaNumero') or '—'
-    hoje = datetime.now().strftime('%d/%m/%Y')
-    ref_linha = f"[Smart Report] OS nº {os_num} / Pedido de Venda nº {pv_num} — gerados em {hoje}."
-
-    # Lê o cObs atual pra ANEXAR (sem apagar o diagnóstico do vendedor).
-    obs_atual = ''
-    try:
-        cons = omie_call('/crm/oportunidades/', 'ConsultarOportunidade', {"nCodOp": int(draft['crmOpId'])})
-        obs_atual = (cons.get('observacoes', {}) or {}).get('cObs', '') or ''
-    except OmieError:
-        pass
-    # Anexa só as linhas ainda não presentes (idempotência).
-    # Com "faturar pelo robô", OS/PV ainda não existem (números '—') -> não registra
-    # a referência cruzada aqui (o robô gera os documentos depois).
-    linhas_novas = []
-    tem_numeros = (os_num != '—') or (pv_num != '—')
-    if tem_numeros and f"OS nº {os_num}" not in obs_atual:
-        linhas_novas.append(ref_linha)
-    if fase_atual == CRM_FASE_PREPARACAO and draft.get('execEstado') == 'aprovado' and 'Teste do equipamento' not in obs_atual:
-        linhas_novas.append(f"[Smart Report] Teste do equipamento: APROVADO em {hoje}.")
-    novo_obs = obs_atual
-    if linhas_novas:
-        novo_obs = (obs_atual + ("\n\n" if obs_atual else "") + "\n".join(linhas_novas)).strip()
-
-    # Uma única chamada: grava a referência e (se houver) move a fase.
-    param_alt = {
-        "identificacao": {"nCodOp": int(draft['crmOpId'])},
-        "observacoes": {"cObs": novo_obs}
-    }
-    if nova_fase:
-        param_alt["fasesStatus"] = {"nCodFase": nova_fase}
-    try:
-        omie_call('/crm/oportunidades/', 'AlterarOportunidade', param_alt)
-        if nova_fase:
-            draft['crmFaseCodigo'] = nova_fase
-            fase_movida = True
-    except OmieError as e:
-        fase_warning = f"Não consegui atualizar a oportunidade (fase/observações): {e}"
-    if not nova_fase and not fase_warning:
-        fase_warning = f"Fase atual ({CRM_FASES.get(fase_atual, fase_atual)}) não tem transição automática definida."
-
-    draft['crmFinalizadoAt'] = datetime.utcnow().isoformat() + "Z"
+    num = draft.get('omieOsNumber')
+    cartao = _painel_cartao_da_os(full_data, num)
+    destino = 'final' if draft.get('execEstado') == 'aprovado' else (
+        'aprov' if cartao and cartao.get('col') in ('chegada', 'analise') else None)
+    movido, aviso = False, None
+    if not cartao:
+        aviso = f"OS {num or '—'} não encontrada no painel: preencha o nº da OS no cartão do painel."
+    elif destino:
+        antes = cartao.get('col')
+        _painel_mover_por_os(full_data, num, destino, user)
+        movido = cartao.get('col') != antes
+    draft['painelFinalizadoAt'] = datetime.utcnow().isoformat() + "Z"
     save_data(full_data)
+    nome_col = next((c['name'] for c in _painel_estado(full_data)['cols'] if cartao and c['id'] == cartao.get('col')), '')
     return jsonify({
-        "success": True,
-        "oportunidade": draft.get('crmOpNum') or draft.get('crmOpId'),
-        "osNumero": draft.get('omieOsNumber'),
-        "pvNumero": draft.get('pedidoVendaNumero'),
-        "faseMovida": fase_movida,
-        "faseNova": CRM_FASES.get(nova_fase, '') if nova_fase else '',
-        "warning": fase_warning,
-        "anexoWarning": draft.get('crmAnexoWarning'),
+        "success": True, "osNumero": num, "pvNumero": draft.get('pedidoVendaNumero'),
+        "faseMovida": movido, "faseNova": nome_col if movido else '', "warning": aviso,
     })
 
 
@@ -5509,20 +5122,20 @@ def os_send(os_id):
         if not p.get('omieProductId'):
             return jsonify({"error": f"Peça '{p.get('description','')}' não está vinculada ao catálogo Omie."}), 400
 
-    # FATURAR PELO ROBÔ: não cria OS+PV via API (o robô Playwright fatura pela tela
-    # do Omie). Mantém o draft local 'sent' pra o robô ler os itens via
-    # /itens-faturamento. Só pra OS NOVA (CREATE) — OS importada do Omie segue normal.
-    if _faturar_pelo_robo(full_data) and not is_update:
+    # ROBÔ: a OS já existe no Omie (criada pela equipe; o Smart só a traz pelo número). Aqui NÃO se cria nem
+    # se altera nada via API: o rascunho fica 'sent' e o robô PREENCHE os dados e as peças dentro da OS.
+    if _faturar_pelo_robo(full_data):
+        if not (draft.get('omieOsId') and draft.get('omieOsNumber')):
+            return jsonify({"error": "Esta OS ainda não está ligada à OS do Omie. Abra-a pelo número da OS (painel) antes de enviar."}), 400
         draft['status'] = 'sent'
         draft['faturadoPeloRobo'] = True
-        draft['omieOsId'] = None
-        draft['omieOsNumber'] = None
         draft['sentAt'] = datetime.utcnow().isoformat() + "Z"
         draft['sendError'] = None
         draft['pedidoVendaError'] = None
+        draft.pop('roboFaturadoAt', None)
         save_data(full_data)
-        return jsonify({**draft, "warning": "Itens prontos. A OS e o Pedido de Venda "
-                        "NÃO foram criados via API — faça o faturamento pelo robô (Omie web)."})
+        return jsonify({**draft, "warning": "Itens prontos. O robô vai preencher os dados e as peças na OS "
+                        f"{draft.get('omieOsNumber')} do Omie."})
 
     # Garantia APROVADA: a OS é de garantia (valor ZERO, sem cobrança) e NÃO gera Pedido de Venda.
     garantia_status = (draft.get('garantiaStatus') or 'avulsa')
@@ -5533,10 +5146,6 @@ def os_send(os_id):
     if garantia_aprovada and 'GARANTIA' not in obs_combinada.upper():
         nota_gar = "ATENDIMENTO EM GARANTIA — reparo sem custo ao cliente (valores zerados)."
         obs_combinada = (nota_gar + ("\n\n" + obs_combinada if obs_combinada else "")).strip()
-    # Referência cruzada: se a OS veio de uma oportunidade do CRM, registra o nº dela.
-    if draft.get('crmOpNum') and 'Oportunidade CRM' not in obs_combinada:
-        ref_op = f"Ref. Oportunidade CRM nº {draft['crmOpNum']}"
-        obs_combinada = (ref_op + ("\n\n" + obs_combinada if obs_combinada else "")).strip()
 
     itens = []
     for idx, s in enumerate(draft.get('services', [])):
@@ -5845,11 +5454,10 @@ HTML_PAGE = """
             const [mustChangePwd, setMustChangePwd] = useState(false);
             const [pwdChangeMsg, setPwdChangeMsg] = useState("");
             const [tempPasswordInfo, setTempPasswordInfo] = useState(null); // {username, password}
-            const [crmOps, setCrmOps] = useState([]);
-            const [loadingCrm, setLoadingCrm] = useState(false);
-            const [crmFiltro, setCrmFiltro] = useState('todas'); // todas | analise | preparacao
-            const [crmBusca, setCrmBusca] = useState('');        // busca por nº / cliente / equipamento
-            const [puxandoCrm, setPuxandoCrm] = useState(null); // nCodOp sendo puxado
+            const [analises, setAnalises] = useState(null);          // cartões do painel em Aguardando Análise
+            const [loadingAnalises, setLoadingAnalises] = useState(false);
+            const [analiseBusca, setAnaliseBusca] = useState('');
+            const [puxandoOs, setPuxandoOs] = useState(null);       // nº da OS sendo puxada pro laudo
             const [serialBusca, setSerialBusca] = useState('');
             const [serialResultados, setSerialResultados] = useState(null); // null = não buscou ainda
             const [arquivados, setArquivados] = useState(null);
@@ -5862,12 +5470,6 @@ HTML_PAGE = """
             const [relCli, setRelCli] = useState('');
             const [relEquip, setRelEquip] = useState('');
             const [relTec, setRelTec] = useState('');
-            const [tempoFases, setTempoFases] = useState(null);
-            const [tempoFasesRaw, setTempoFasesRaw] = useState(false); // mostrar datas brutas (conferência do mapeamento)
-            const [tfFase, setTfFase] = useState('todas');   // filtro de fase
-            const [tfDias, setTfDias] = useState('todos');   // filtro de dias parados
-            const [tfBusca, setTfBusca] = useState('');      // busca por nº/descrição
-            const [tfOrdem, setTfOrdem] = useState('dias');  // ordenação: dias | entrada
 
             // DADOS GLOBAIS (Admin dita as regras)
             const [headerConfig, setHeaderConfig] = useState([]);
@@ -6185,20 +5787,20 @@ HTML_PAGE = """
                 }
             }, [activeTab, auth, currentOs]);
 
-            // ---- CRM / Oportunidades ----
-            const fetchCrmOportunidades = () => {
-                setLoadingCrm(true);
-                fetch('/api/crm/oportunidades', { headers: { 'Authorization': auth.token } })
+            // ---- Aguardando Análise (cartões do Painel de Manutenção) ----
+            const fetchAnalises = () => {
+                setLoadingAnalises(true);
+                fetch('/api/painel', { headers: { 'Authorization': auth.token } })
                     .then(r => r.json()).then(d => {
-                        setCrmOps(d.items || []);
-                        setLoadingCrm(false);
-                    }).catch(() => setLoadingCrm(false));
+                        setAnalises((d.ordens || []).filter(o => o.col === 'analise'));
+                        setLoadingAnalises(false);
+                    }).catch(() => setLoadingAnalises(false));
             };
 
             useEffect(() => {
-                if (auth && activeTab === 'crm') {
-                    if (crmOps.length === 0) fetchCrmOportunidades();
-                    fetchOsDrafts(); // pra marcar quais oportunidades já viraram OS
+                if (auth && activeTab === 'analises') {
+                    fetchAnalises();
+                    fetchOsDrafts(); // pra marcar quais já têm laudo/OS no Smart
                 }
             }, [activeTab, auth]);
 
@@ -6394,14 +5996,8 @@ HTML_PAGE = """
                 fetch('/api/admin/relatorio?' + qs.toString(), { headers: { 'Authorization': auth.token } })
                     .then(r => r.json()).then(setRelatorio).catch(() => setRelatorio(null));
             };
-            const fetchTempoFases = () => {
-                setTempoFases('loading');
-                fetch('/api/admin/crm-tempo-fases', { headers: { 'Authorization': auth.token } })
-                    .then(r => r.json()).then(setTempoFases).catch(() => setTempoFases(null));
-            };
             useEffect(() => {
                 if (auth && auth.role === 'admin' && activeTab === 'relatorios' && relatorio === null) fetchRelatorio();
-                if (auth && auth.role === 'admin' && activeTab === 'relatorios' && tempoFases === null) fetchTempoFases();
             }, [activeTab, auth]);
             const exportRelatorioCSV = () => {
                 if (!relatorio || !relatorio.items) return;
@@ -6425,52 +6021,50 @@ HTML_PAGE = """
                 }
             };
 
-            const moverFaseCrm = async (nCodOp, nCodFase, nomeFase) => {
-                if (!confirm(`Mover esta oportunidade para "${nomeFase}"?`)) return;
+            // Pré-preenche o laudo com a OS do Omie cujo número está no cartão do painel.
+            const puxarOsParaLaudo = async (numOs) => {
+                setPuxandoOs(numOs);
                 try {
-                    const d = await fetch(`/api/crm/oportunidade/${nCodOp}/mover-fase`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
-                        body: JSON.stringify({ nCodFase: nCodFase })
-                    }).then(r => r.json());
-                    if (d.success) {
-                        alert(`Oportunidade movida para: ${d.faseNome}`);
-                        fetchCrmOportunidades();
-                    } else {
-                        alert('Erro: ' + (d.error || 'falha ao mover fase'));
-                    }
-                } catch (e) {
-                    alert('Erro de rede: ' + (e.message || e));
-                }
-            };
-
-            const puxarOportunidadeParaLaudo = async (nCodOp) => {
-                setPuxandoCrm(nCodOp);
-                try {
-                    const d = await fetch(`/api/crm/oportunidade/${nCodOp}`, { headers: { 'Authorization': auth.token } }).then(r => r.json());
-                    if (d.error) { alert('Erro ao puxar oportunidade: ' + d.error); return; }
+                    const d = await fetch(`/api/os/laudo-da-os/${encodeURIComponent(numOs)}`, { headers: { 'Authorization': auth.token } }).then(r => r.json());
+                    if (d.error) { alert('Erro ao puxar a OS: ' + d.error); return; }
                     const patch = {};
                     const setField = (id, val) => { const f = headerConfig.find(x => x.id === id); if (f && val) patch[id] = val; };
                     setField('client', d.laudo.client);
                     setField('model', d.laudo.model);
                     setField('serial', d.laudo.serial);
                     setField('defect', d.laudo.defect);
-                    // Vínculo com a oportunidade (usado na finalização — Fase 3)
-                    patch.crmOpId = d.nCodOp;
-                    patch.crmOpNum = d.cNumOp;
-                    patch.crmFaseCodigo = d.faseCodigo;
-                    patch.crmClienteOmieId = d.cliente ? d.cliente.omieClientId : null;
-                    // Sugere garantia se a descrição/defeito mencionar
+                    // Vínculo com a OS do Omie (o envio e o robô trabalham em cima dela)
+                    patch.omieOsId = d.omieOsId;
+                    patch.omieOsNumber = d.omieOsNumber;
+                    patch.omieClienteId = d.cliente ? d.cliente.omieClientId : null;
                     const txtGar = ((d.descricao || '') + ' ' + (d.laudo.defect || '')).toLowerCase();
                     patch.garantiaSugerida = /garantia|garantido/.test(txtGar);
                     setHeaderData(prev => ({ ...prev, ...patch }));
                     setActiveTab('report');
-                    const semCad = d.cliente ? '' : '\\n\\n(Atenção: cliente ainda não tem cadastro de faturamento — selecione/cadastre ao gerar a OS.)';
-                    alert(`Laudo pré-preenchido da oportunidade ${d.cNumOp}.\\n\\nCliente: ${d.laudo.client}\\nEquipamento: ${d.laudo.model || '—'}\\nSérie: ${d.laudo.serial || '—'}` + semCad);
+                    alert(`Laudo pré-preenchido da OS ${d.omieOsNumber}.\\n\\nCliente: ${d.laudo.client}\\nEquipamento: ${d.laudo.model || '—'}\\nSérie: ${d.laudo.serial || '—'}`);
                 } catch (e) {
                     alert('Erro de rede: ' + (e.message || e));
                 } finally {
-                    setPuxandoCrm(null);
+                    setPuxandoOs(null);
+                }
+            };
+
+            // Traz a OS do Omie (pelo nº do cartão do painel) para o Smart, pra executar na bancada.
+            const abrirOsDoPainel = async (numOs) => {
+                setPuxandoOs(numOs);
+                try {
+                    const d = await fetch('/api/os/abrir-por-numero', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ numero: numOs })
+                    }).then(r => r.json());
+                    if (d.error) { alert('Erro: ' + d.error); return; }
+                    fetchBancada();
+                    fetchOsDrafts();
+                } catch (e) {
+                    alert('Erro de rede: ' + (e.message || e));
+                } finally {
+                    setPuxandoOs(null);
                 }
             };
 
@@ -6610,19 +6204,17 @@ HTML_PAGE = """
                 // depois, mesmo após a OS ter sido enviada ao Omie.
                 const laudoId = await salvarLaudoVinculado(headerData.laudoId, clientName ? `${clientName} — ${modelName || 'laudo'}` : null);
                 if (laudoId) setHeaderData(prev => ({ ...prev, laudoId }));
-                // Se o laudo veio de uma oportunidade do CRM, já temos o cliente de
-                // faturamento resolvido (por CPF/CNPJ) — vincula direto, sem busca por nome.
-                const clientPrefill = headerData.crmClienteOmieId
-                    ? { omieClientId: headerData.crmClienteOmieId, name: clientName, document: '', email: '', phone: '' }
+                // Se o laudo veio de uma OS do Omie, já temos o cliente de faturamento — vincula direto.
+                const clientPrefill = headerData.omieClienteId
+                    ? { omieClientId: headerData.omieClienteId, name: clientName, document: '', email: '', phone: '' }
                     : { omieClientId: null, name: clientName, document: '', email: '', phone: '' };
                 createNewOs({
                     fromLaudo: { client: clientName, model: modelName, defect, laudoTecnico: headerData.laudoTecnico || '', generatedAt: new Date().toISOString() },
                     client: clientPrefill,
                     observations: obs,
                     laudoId: laudoId || null,
-                    crmOpId: headerData.crmOpId || null,
-                    crmOpNum: headerData.crmOpNum || null,
-                    crmFaseCodigo: headerData.crmFaseCodigo || null,
+                    omieOsId: headerData.omieOsId || null,
+                    omieOsNumber: headerData.omieOsNumber || null,
                     garantiaStatus: headerData.garantiaStatus || 'avulsa',
                     garantiaMotivo: headerData.garantiaMotivo || ''
                 });
@@ -6746,8 +6338,8 @@ HTML_PAGE = """
 
             const anexarFotosLaudo = async () => {
                 console.log('[anexarFotosLaudo] iniciando', { os: currentOs, fotos: reportImages?.length });
-                if (!currentOs || (!currentOs.omieOsId && !currentOs.crmOpId)) {
-                    alert('A OS precisa estar enviada/importada do Omie (ou vinculada a uma oportunidade).');
+                if (!currentOs || !currentOs.omieOsId) {
+                    alert('A OS precisa estar ligada à OS do Omie (abra-a pelo número da OS).');
                     return;
                 }
                 if (!reportImages || reportImages.length === 0) {
@@ -6784,8 +6376,8 @@ HTML_PAGE = """
             };
 
             const anexarLaudoPDF = async () => {
-                if (!currentOs || (!currentOs.omieOsId && !currentOs.crmOpId)) {
-                    alert('A OS precisa estar enviada/importada do Omie (ou vinculada a uma oportunidade).');
+                if (!currentOs || !currentOs.omieOsId) {
+                    alert('A OS precisa estar ligada à OS do Omie (abra-a pelo número da OS).');
                     return;
                 }
                 const destinoPdf = currentOs.omieOsId ? 'à OS' : 'à oportunidade';
@@ -7130,7 +6722,7 @@ HTML_PAGE = """
                     // OS JÁ enviada (ex.: faturada pelo robô). NÃO reenvia — o backend recusaria
                     // com "OS já foi enviada anteriormente". Segue direto pras etapas de anexo/CRM
                     // (permite re-anexar PDF/fotos atualizados e finalizar a fase da oportunidade).
-                    avisos.push('OS já estava enviada — pulei o reenvio e segui com PDF/fotos/CRM.');
+                    avisos.push('OS já estava enviada — pulei o reenvio e segui com PDF/fotos/painel.');
                 } else {
                     try {
                         const savedOs = await saveCurrentOs(true);
@@ -7185,8 +6777,8 @@ HTML_PAGE = """
                     } catch (e) { erros.push('PDF: ' + (e.message || e)); }
                 }
 
-                // Etapa 3: anexar fotos (se houver fotos E destino: OS no Omie OU oportunidade)
-                if (reportImages && reportImages.length > 0 && (osAtual.omieOsId || osAtual.crmOpId)) {
+                // Etapa 3: anexar fotos na OS do Omie (se houver fotos)
+                if (reportImages && reportImages.length > 0 && osAtual.omieOsId) {
                     try {
                         const r3 = await fetch(`/api/os/${osAtual.id}/anexar-fotos`, {
                             method: 'POST',
@@ -7203,11 +6795,11 @@ HTML_PAGE = """
                     } catch (e) { erros.push('Fotos: ' + (e.message || e)); }
                 }
 
-                // Etapa 4 (CRM): se a OS veio de uma oportunidade, move a fase e coleta os números
+                // Etapa 4 (Painel): move o cartão do painel (achado pelo nº da OS) e coleta os números
                 let crmInfo = null;
-                if (osAtual.crmOpId) {
+                if (osAtual.omieOsNumber) {
                     try {
-                        const r4 = await fetch(`/api/os/${osAtual.id}/crm-finalizar`, {
+                        const r4 = await fetch(`/api/os/${osAtual.id}/painel-finalizar`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json', 'Authorization': auth.token }
                         });
@@ -7215,11 +6807,10 @@ HTML_PAGE = """
                         if (d4.success) {
                             crmInfo = d4;
                             if (d4.warning) avisos.push(d4.warning);
-                            if (d4.anexoWarning) avisos.push(d4.anexoWarning);
                         } else {
-                            erros.push('CRM: ' + (d4.error || 'erro ao finalizar oportunidade'));
+                            erros.push('Painel: ' + (d4.error || 'erro ao atualizar o painel'));
                         }
-                    } catch (e) { erros.push('CRM: ' + (e.message || e)); }
+                    } catch (e) { erros.push('Painel: ' + (e.message || e)); }
                 }
 
                 // Re-salva o laudo (versão final) vinculado à OS, antes de limpar a tela —
@@ -7235,10 +6826,8 @@ HTML_PAGE = """
                     alert('Concluído com erros:\\n' + erros.join('\\n') + '\\n\\nVerifique e tente as etapas individualmente.');
                 } else if (crmInfo) {
                     let msg = 'Processo concluído com sucesso!\\n\\n';
-                    msg += `Oportunidade: ${crmInfo.oportunidade || '—'}\\n`;
-                    msg += `Ordem de Serviço: ${crmInfo.osNumero || '—'}\\n`;
-                    msg += `Pedido de Venda: ${crmInfo.pvNumero || '— (sem peças)'}`;
-                    if (crmInfo.faseMovida) msg += `\\n\\nOportunidade movida para: ${crmInfo.faseNova}`;
+                    msg += `Ordem de Serviço: ${crmInfo.osNumero || '—'}`;
+                    if (crmInfo.faseMovida) msg += `\\n\\nCartão do painel movido para: ${crmInfo.faseNova}`;
                     if (avisos.length) msg += '\\n\\n⚠️ ' + avisos.join('\\n⚠️ ');
                     msg += '\\n\\nOs dados do laudo serão limpos.';
                     alert(msg);
@@ -8276,23 +7865,6 @@ HTML_PAGE = """
             const renderRelatorios = () => {
                 const r = relatorio;
                 const fmt = (v) => 'R$ ' + parseFloat(v || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                // Filtros do "Tempo nas fases" (client-side sobre tempoFases.items)
-                const tfTotal = (tempoFases && tempoFases.items) ? tempoFases.items.length : 0;
-                let tfItens = (tempoFases && tempoFases.items) ? tempoFases.items.filter(it => {
-                    if (tfFase !== 'todas' && String(it.faseCodigo) !== String(tfFase)) return false;
-                    if (tfDias === '7' && !(it.diasNaFase >= 7)) return false;
-                    if (tfDias === '15' && !(it.diasNaFase >= 15)) return false;
-                    if (tfBusca) {
-                        const q = tfBusca.toLowerCase();
-                        if (!((it.cNumOp || '').toLowerCase().includes(q) || (it.descricao || '').toLowerCase().includes(q))) return false;
-                    }
-                    return true;
-                }) : [];
-                // Padrão ('dias') já vem do backend ordenado por mais dias parado primeiro.
-                if (tfOrdem === 'recentes') {
-                    // entrada mais recente primeiro = menos dias parado (sem data por último)
-                    tfItens = [...tfItens].sort((a, b) => (a.diasNaFase === null) - (b.diasNaFase === null) || (a.diasNaFase || 0) - (b.diasNaFase || 0));
-                }
                 const barra = (label, valor, max, cor, sufixo) => html`
                     <div className="mb-2">
                         <div className="flex justify-between text-xs mb-0.5"><span className="text-slate-600 truncate pr-2">${label}</span><span className="font-bold text-slate-700 whitespace-nowrap">${sufixo || valor}</span></div>
@@ -8303,7 +7875,7 @@ HTML_PAGE = """
                         <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col md:flex-row md:items-end gap-3 justify-between">
                             <div>
                                 <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-chart-bar text-teal-600 text-2xl"></i> Relatórios Gerenciais</h2>
-                                <p className="text-sm text-slate-500 mt-1">Peças, serviços, técnico e valores das OS da filial, e tempo nas fases do CRM.</p>
+                                <p className="text-sm text-slate-500 mt-1">Peças, serviços, técnico e valores das OS da filial.</p>
                             </div>
                             <div className="flex gap-2 flex-wrap items-end">
                                 <div><label className="block text-xs text-slate-500">De</label><input type="date" value=${relDe} onChange=${e => setRelDe(e.target.value)} className="p-2 border border-slate-300 rounded text-sm" /></div>
@@ -8372,63 +7944,7 @@ HTML_PAGE = """
                             </div>
                         `}
 
-                        ${''/* ---- Tempo nas fases (CRM) ---- */}
-                        <div className="bg-white p-5 rounded-xl border border-slate-200">
-                            <div className="flex justify-between items-center mb-1 flex-wrap gap-2">
-                                <h3 className="font-semibold text-slate-700 flex items-center gap-2"><i className="ph-fill ph-hourglass-medium text-amber-600"></i> Tempo nas fases (oportunidades abertas)</h3>
-                                <button onClick=${fetchTempoFases} className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded text-sm font-medium"><i className="ph-bold ph-arrows-clockwise"></i> Atualizar</button>
-                            </div>
-                            <p className="text-xs text-slate-400 mb-3">Dias parados na fase atual = hoje − última transição (maior data do fasesStatus). Métrica direta, não depende de mapear cada data a uma fase.</p>
-                            ${tempoFases === 'loading' && html`<div className="text-center py-6 text-slate-500"><i className="ph ph-spinner animate-spin text-2xl"></i></div>`}
-                            ${tempoFases && tempoFases !== 'loading' && tempoFases.error && html`<div className="text-sm text-red-600">Erro: ${tempoFases.error}</div>`}
-                            ${tempoFases && tempoFases !== 'loading' && tempoFases.resumo && html`
-                                ${tempoFases.erro ? html`<div className="text-xs text-amber-600 mb-2">⚠️ ${tempoFases.erro}</div>` : ''}
-                                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
-                                    ${tempoFases.resumo.map(s => html`
-                                        <button key=${s.fase} type="button" onClick=${() => setTfFase(String(tfFase) === String(s.faseCodigo) ? 'todas' : String(s.faseCodigo))} className=${`text-left rounded-lg p-3 border transition ${String(tfFase) === String(s.faseCodigo) ? 'bg-amber-100 border-amber-400 ring-1 ring-amber-400' : 'bg-amber-50 border-amber-200 hover:border-amber-300'}`} title="Clique para filtrar por esta fase">
-                                            <div className="text-xs text-slate-500 uppercase truncate">${s.fase}</div>
-                                            <div className="text-2xl font-bold text-amber-700">${s.diasMedio !== null ? s.diasMedio + ' dias' : '—'}</div>
-                                            <div className="text-xs text-slate-400">${s.qtd} aberta(s) · máx ${s.diasMax} dias</div>
-                                        </button>
-                                    `)}
-                                </div>
-                                <div className="flex flex-wrap items-center gap-2 mb-2 text-sm">
-                                    <span className="text-xs text-slate-400">Fase:</span>
-                                    ${[['todas', 'Todas'], ['10843780550', '01 Análise'], ['10843780551', '02 Aprovação'], ['10843780552', '03 Preparação']].map(([k, label]) => html`
-                                        <button key=${k} onClick=${() => setTfFase(k)} className=${`px-2.5 py-1 rounded-lg text-xs font-medium transition ${String(tfFase) === k ? 'bg-amber-600 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-100'}`}>${label}</button>
-                                    `)}
-                                    <span className="text-xs text-slate-400 ml-2">Parados:</span>
-                                    ${[['todos', 'Todos'], ['7', '≥ 7 dias'], ['15', '≥ 15 dias']].map(([k, label]) => html`
-                                        <button key=${k} onClick=${() => setTfDias(k)} className=${`px-2.5 py-1 rounded-lg text-xs font-medium transition ${tfDias === k ? 'bg-amber-600 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-100'}`}>${label}</button>
-                                    `)}
-                                    <select value=${tfOrdem} onChange=${e => setTfOrdem(e.target.value)} className="text-xs p-1.5 border border-slate-300 rounded bg-white ml-2" title="Ordenação">
-                                        <option value="dias">Mais parados primeiro</option>
-                                        <option value="recentes">Mais recentes primeiro</option>
-                                    </select>
-                                    <input type="text" value=${tfBusca} onChange=${e => setTfBusca(e.target.value)} placeholder="Buscar nº ou descrição" className="p-1.5 border border-slate-300 rounded text-xs flex-1 min-w-[140px]" />
-                                </div>
-                                <div className="flex justify-between items-center mb-2 text-xs text-slate-400">
-                                    <span>Mostrando ${tfItens.length} de ${tfTotal}${(tfFase !== 'todas' || tfDias !== 'todos' || tfBusca) ? html` · <button onClick=${() => { setTfFase('todas'); setTfDias('todos'); setTfBusca(''); }} className="text-amber-600 hover:underline">limpar filtros</button>` : ''}</span>
-                                    <button onClick=${() => setTempoFasesRaw(!tempoFasesRaw)} className="text-slate-500 hover:text-slate-700 underline">${tempoFasesRaw ? 'ocultar' : 'mostrar'} datas brutas (conferir mapeamento)</button>
-                                </div>
-                                <div className="overflow-x-auto rounded border border-slate-200 max-h-[400px] overflow-y-auto">
-                                    <table className="min-w-full text-sm">
-                                        <thead className="bg-slate-100 text-slate-700 sticky top-0"><tr><th className="p-2 text-left">Nº</th><th className="p-2 text-left">Descrição</th><th className="p-2 text-left">Fase atual</th><th className="p-2 text-left">Entrada</th><th className="p-2 text-right">Dias</th>${tempoFasesRaw ? html`<th className="p-2 text-left">Datas brutas (fasesStatus)</th>` : ''}</tr></thead>
-                                        <tbody className="divide-y divide-slate-100">
-                                            ${tfItens.length === 0 ? html`<tr><td colSpan=${tempoFasesRaw ? 6 : 5} className="p-3 text-center text-slate-400">${tfTotal === 0 ? 'Nenhuma oportunidade aberta nas fases monitoradas.' : 'Nenhuma oportunidade com os filtros atuais.'}</td></tr>` : tfItens.map(it => html`<tr key=${it.nCodOp} className="hover:bg-slate-50">
-                                                <td className="p-2 text-xs font-mono whitespace-nowrap">${it.cNumOp || '—'}</td>
-                                                <td className="p-2 text-xs max-w-xs truncate" title=${it.descricao}>${it.descricao || '—'}</td>
-                                                <td className="p-2 text-xs">${it.faseNome}</td>
-                                                <td className="p-2 text-xs whitespace-nowrap">${it.entrada || '—'}</td>
-                                                <td className=${'p-2 text-xs text-right font-bold ' + (it.diasNaFase >= 15 ? 'text-red-600' : (it.diasNaFase >= 7 ? 'text-amber-600' : 'text-slate-700'))}>${it.diasNaFase !== null ? it.diasNaFase : '—'}</td>
-                                                ${tempoFasesRaw ? html`<td className="p-2 text-[10px] text-slate-400 font-mono">${Object.keys(it.datasBrutas || {}).length ? Object.entries(it.datasBrutas).map(([k, v]) => `${k}=${v}`).join('  ') : '—'}</td>` : ''}
-                                            </tr>`)}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            `}
-                        </div>
-                    </div>
+                                            </div>
                 `;
             };
 
@@ -8455,7 +7971,7 @@ HTML_PAGE = """
                     lista = [...lista].sort((a, b) => ((b.urgencia === 'urgente') - (a.urgencia === 'urgente')) || String(a.criadoEm).localeCompare(String(b.criadoEm)));
                 }
                 const osOpcoes = (osDrafts || []).slice(0, 80).map(o => {
-                    const ref = o.omieOsNumber ? ('OS ' + o.omieOsNumber) : (o.crmOpNum ? ('Op ' + o.crmOpNum) : 'Rascunho');
+                    const ref = o.omieOsNumber ? ('OS ' + o.omieOsNumber) : 'Rascunho';
                     return { id: o.id, rotulo: ref + ' — ' + ((o.client && o.client.name) || 'sem cliente') };
                 });
 
@@ -8650,12 +8166,12 @@ HTML_PAGE = """
                                                     <thead className="bg-slate-100 text-slate-700"><tr><th className="p-2 text-left">Nº Op</th><th className="p-2 text-left">Cliente</th><th className="p-2 text-center">Prod.</th><th className="p-2 text-center">Serv.</th><th className="p-2 text-left">Esperando desde</th><th className="p-2 text-right">Ação</th></tr></thead>
                                                     <tbody className="divide-y divide-slate-100">
                                                         ${filaRobo.pendentes.map((p, i) => html`<tr key=${i} className="hover:bg-slate-50">
-                                                            <td className="p-2 font-mono text-xs whitespace-nowrap">${p.crmOpNum}</td>
+                                                            <td className="p-2 font-mono text-xs whitespace-nowrap">${p.osNum}</td>
                                                             <td className="p-2 text-xs">${p.cliente || '—'}</td>
                                                             <td className="p-2 text-center text-xs">${p.qtdProdutos}</td>
                                                             <td className="p-2 text-center text-xs">${p.qtdServicos}</td>
                                                             <td className="p-2 text-xs whitespace-nowrap">${(p.sentAt || '').slice(0, 16).replace('T', ' ')}</td>
-                                                            <td className="p-2 text-right"><button onClick=${() => removerDaFila(p.osId, p.crmOpNum)} className="text-red-600 hover:text-red-800 text-xs font-medium whitespace-nowrap" title="Marcar como já faturada e remover da fila"><i className="ph-bold ph-x-circle"></i> Remover</button></td>
+                                                            <td className="p-2 text-right"><button onClick=${() => removerDaFila(p.osId, p.osNum)} className="text-red-600 hover:text-red-800 text-xs font-medium whitespace-nowrap" title="Marcar como já faturada e remover da fila"><i className="ph-bold ph-x-circle"></i> Remover</button></td>
                                                         </tr>`)}
                                                     </tbody>
                                                 </table>
@@ -8666,7 +8182,7 @@ HTML_PAGE = """
                                                 <div className="space-y-1">
                                                     ${filaRobo.recentes.map((r, i) => html`<div key=${i} className="flex items-center justify-between gap-2 text-xs bg-slate-50 rounded px-3 py-1.5">
                                                         <div className="min-w-0 truncate">
-                                                            <span className="font-mono text-slate-600">${r.crmOpNum}</span>
+                                                            <span className="font-mono text-slate-600">${r.osNum}</span>
                                                             <span className="text-slate-500 ml-2">${r.cliente || ''}</span>
                                                         </div>
                                                         <div className="text-slate-400 whitespace-nowrap flex items-center gap-2">
@@ -9277,115 +8793,61 @@ HTML_PAGE = """
                 `;
             };
 
-            const renderCRM = () => {
-                // Mapeia oportunidades que já viraram OS no sistema (pelo crmOpId no rascunho) —
-                // usado pra badge de OS E pra buscar pelo nome do cliente do laudo/OS.
-                const draftPorOp = {};
-                (osDrafts || []).forEach(d => { if (d.crmOpId) draftPorOp[String(d.crmOpId)] = d; });
-                const termoBusca = crmBusca.trim().toLowerCase();
-                const opsFiltradas = crmOps.filter(o => {
-                    const faseOk = crmFiltro === 'analise' ? o.faseCodigo === 10843780550
-                        : crmFiltro === 'aprovacao' ? o.faseCodigo === 10843780551
-                        : crmFiltro === 'preparacao' ? o.faseCodigo === 10843780552
-                        : true;
-                    if (!faseOk) return false;
-                    if (!termoBusca) return true;
-                    // Busca por Nº da op, nome do cliente, equipamento e Nº de série. Nome/serial vêm
-                    // da descrição+observações (backend parseia serial); e o nome exato do cliente vem
-                    // do laudo/OS quando a op já virou OS (draftPorOp).
-                    const dOp = draftPorOp[String(o.nCodOp)];
-                    const nomeDraft = dOp ? (((dOp.client || {}).name) || ((dOp.fromLaudo || {}).client) || '') : '';
-                    const alvo = [o.cNumOp, o.descricao, o.serial, o.equipamento, nomeDraft]
-                        .filter(Boolean).join(' ').toLowerCase();
-                    return alvo.includes(termoBusca);
+            const renderAnalises = () => {
+                // OS que já têm rascunho no Smart (pelo nº da OS) — badge e busca pelo nome do cliente.
+                const draftPorOs = {};
+                (osDrafts || []).forEach(d => { if (d.omieOsNumber) draftPorOs[String(d.omieOsNumber)] = d; });
+                const termo = analiseBusca.trim().toLowerCase();
+                const lista = (analises || []).filter(o => {
+                    if (!termo) return true;
+                    return [o.os, o.cliente, o.serie, o.equipamento, o.modelo].filter(Boolean).join(' ').toLowerCase().includes(termo);
                 });
-                const fmt = (v) => 'R$ ' + parseFloat(v || 0).toFixed(2);
-                const FASES_CRM = [
-                    [10843780550, '01 Em Análise'], [10843780551, '02 Em Aprovação'],
-                    [10843780552, '03 Em Preparação'], [10843780553, '04 Finalizadas'],
-                    [10843780554, '05 Pagos para envio'], [10843780555, '06 Enviadas']
-                ];
+                const fmtData = (iso) => iso ? iso.split('-').reverse().join('/') : '';
                 return html`
-                    <div className="space-y-4 animate-in fade-in duration-300">
-                        <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col md:flex-row md:items-center gap-3 justify-between">
+                    <div className="space-y-4">
+                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-wrap items-center justify-between gap-3">
                             <div>
-                                <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-funnel text-amber-600 text-2xl"></i> Oportunidades do CRM</h2>
-                                <p className="text-sm text-slate-500 mt-1">Oportunidades criadas pelo vendedor. Carregue uma pra iniciar o laudo com os dados já preenchidos.</p>
+                                <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-magnifying-glass text-amber-600 text-2xl"></i> Aguardando Análise</h2>
+                                <p className="text-sm text-slate-500 mt-1">Equipamentos do Painel de Manutenção aguardando análise. Puxe a OS para pré-preencher o laudo.</p>
                             </div>
-                            <button onClick=${fetchCrmOportunidades} disabled=${loadingCrm} className="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 whitespace-nowrap disabled:bg-slate-400">
-                                <i className=${`ph-bold ph-arrows-clockwise ${loadingCrm ? 'animate-spin' : ''}`}></i> ${loadingCrm ? 'Carregando...' : 'Atualizar'}
+                            <button onClick=${fetchAnalises} disabled=${loadingAnalises} className="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 disabled:opacity-50">
+                                <i className=${`ph-bold ph-arrows-clockwise ${loadingAnalises ? 'animate-spin' : ''}`}></i> ${loadingAnalises ? 'Carregando...' : 'Atualizar'}
                             </button>
                         </div>
-
-                        <div className="flex gap-2 flex-wrap">
-                            ${[['todas', 'Todas'], ['analise', '01 Em Análise'], ['aprovacao', '02 Em Aprovação'], ['preparacao', '03 Em Preparação']].map(([k, label]) => html`
-                                <button key=${k} onClick=${() => setCrmFiltro(k)} className=${`px-3 py-1.5 rounded-lg text-sm font-medium transition ${crmFiltro === k ? 'bg-amber-600 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-100'}`}>${label}</button>
-                            `)}
-                        </div>
-
                         <div className="flex items-center gap-2">
-                            <div className="relative flex-1">
-                                <i className="ph-bold ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none"></i>
-                                <input type="text" value=${crmBusca} onChange=${e => setCrmBusca(e.target.value)} placeholder="Buscar por nº da op, cliente ou nº de série…" className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm" />
-                            </div>
-                            ${crmBusca && html`<button onClick=${() => setCrmBusca('')} className="text-slate-500 hover:text-slate-700 text-sm font-medium whitespace-nowrap flex items-center gap-1"><i className="ph-bold ph-x"></i> limpar</button>`}
-                            <span className="text-xs text-slate-400 whitespace-nowrap">${opsFiltradas.length} de ${crmOps.length}</span>
+                            <input type="text" value=${analiseBusca} onChange=${e => setAnaliseBusca(e.target.value)} placeholder="Buscar por nº da OS, cliente, equipamento ou nº de série…" className="flex-1 p-2 border border-slate-300 rounded-lg text-sm bg-white" />
+                            <span className="text-xs text-slate-400 whitespace-nowrap">${lista.length} de ${(analises || []).length}</span>
                         </div>
-
-                        ${opsFiltradas.length === 0 && !loadingCrm ? html`
-                            <div className="text-center py-10 text-sm text-slate-400 bg-white rounded-xl border border-slate-200">${termoBusca ? `Nenhuma oportunidade encontrada para "${crmBusca}".` : 'Nenhuma oportunidade nessa fase.'}</div>
+                        ${analises === null ? html`
+                            <div className="text-center py-10 text-sm text-slate-400 bg-white rounded-xl border border-slate-200">Carregando…</div>
+                        ` : lista.length === 0 ? html`
+                            <div className="text-center py-10 text-sm text-slate-400 bg-white rounded-xl border border-slate-200">${termo ? 'Nenhum equipamento encontrado para a busca.' : 'Nenhum equipamento aguardando análise.'}</div>
                         ` : html`
-                            <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
-                                <table className="min-w-full text-sm">
-                                    <thead className="bg-amber-50 text-slate-700">
-                                        <tr>
-                                            <th className="p-3 text-left">Nº</th>
-                                            <th className="p-3 text-left">Descrição (equipamento / defeito)</th>
-                                            <th className="p-3 text-left">Fase</th>
-                                            ${auth.role === 'admin' && html`<th className="p-3 text-right">Ticket</th>`}
-                                            <th className="p-3 text-left">OS</th>
-                                            <th className="p-3 text-right">Ação</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-slate-100">
-                                        ${opsFiltradas.map(o => {
-                                            const draftDaOp = draftPorOp[String(o.nCodOp)];
+                            <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead className="bg-slate-100 text-slate-600 text-xs uppercase"><tr>
+                                        <th className="p-3 text-left">OS</th><th className="p-3 text-left">Cliente</th><th className="p-3 text-left">Equipamento</th>
+                                        <th className="p-3 text-left">Nº série</th><th className="p-3 text-left">Chegada</th><th className="p-3"></th>
+                                    </tr></thead>
+                                    <tbody>
+                                        ${lista.map(o => {
+                                            const dr = o.os ? draftPorOs[String(o.os)] : null;
                                             return html`
-                                            <tr key=${o.nCodOp} className="hover:bg-slate-50">
-                                                <td className="p-3 font-mono text-xs whitespace-nowrap">${o.cNumOp || '—'}</td>
-                                                <td className="p-3 text-xs max-w-md"><div className="text-slate-800">${o.descricao || '—'}</div><div className="text-slate-400 mt-0.5">inclusão: ${o.dInclusao || '—'}</div></td>
-                                                <td className="p-3">
-                                                    <select value=${o.faseCodigo} onChange=${(e) => { const nf = parseInt(e.target.value); const nome = (FASES_CRM.find(f => f[0] === nf) || [])[1] || ''; moverFaseCrm(o.nCodOp, nf, nome); }} className="text-xs p-1 border border-slate-300 rounded bg-white max-w-[150px]">
-                                                        ${FASES_CRM.map(f => html`<option key=${f[0]} value=${f[0]}>${f[1]}</option>`)}
-                                                    </select>
+                                            <tr key=${o.id} className="border-t border-slate-100 hover:bg-slate-50">
+                                                <td className="p-3 font-mono text-xs whitespace-nowrap">${o.os || html`<span className="text-amber-600">sem nº</span>`}</td>
+                                                <td className="p-3">${o.cliente || '—'}</td>
+                                                <td className="p-3">${[o.equipamento, o.modelo].filter(Boolean).join(' ')}</td>
+                                                <td className="p-3 font-mono text-xs">${o.serie || '—'}</td>
+                                                <td className="p-3 text-xs whitespace-nowrap">${fmtData(o.dChegada)}</td>
+                                                <td className="p-3 text-right whitespace-nowrap">
+                                                    ${dr ? html`<span className="text-xs text-indigo-600 font-medium mr-2">já tem OS no Smart</span>` : ''}
+                                                    ${o.os ? html`
+                                                        <button onClick=${() => puxarOsParaLaudo(o.os)} disabled=${puxandoOs === o.os} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-60">
+                                                            ${puxandoOs === o.os ? html`<i className="ph ph-spinner animate-spin"></i> Carregando...` : html`<i className="ph-bold ph-file-text"></i> Puxar para o laudo`}
+                                                        </button>` : html`<span className="text-xs text-slate-400">preencha o nº da OS no painel</span>`}
                                                 </td>
-                                                ${auth.role === 'admin' && html`<td className="p-3 text-xs text-right whitespace-nowrap">${o.ticket.total ? fmt(o.ticket.total) : '—'}</td>`}
-                                                <td className="p-3 text-xs">
-                                                    ${draftDaOp ? (draftDaOp.omieOsNumber ? html`<span className="bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold whitespace-nowrap"><i className="ph-fill ph-check-circle"></i> OS ${draftDaOp.omieOsNumber}</span>` : html`<span className="bg-slate-200 text-slate-600 px-2 py-0.5 rounded font-bold whitespace-nowrap">rascunho</span>`) : html`<span className="text-slate-300">—</span>`}
-                                                </td>
-                                                <td className="p-3 text-right">
-                                                    <div className="flex gap-1 justify-end flex-wrap">
-                                                        ${draftDaOp && html`<button onClick=${async () => {
-                                                            setCurrentOs({ ...draftDaOp, crmFaseCodigo: o.faseCodigo });
-                                                            setActiveTab('os');
-                                                            // Sincroniza a fase atual da oportunidade no draft (pode ter mudado no Omie).
-                                                            try {
-                                                                const r = await fetch(`/api/os/${draftDaOp.id}/sync-crm-fase`, {
-                                                                    method: 'POST',
-                                                                    headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
-                                                                    body: JSON.stringify({ crmFaseCodigo: o.faseCodigo })
-                                                                });
-                                                                const d = await r.json();
-                                                                if (d && d.id) { setCurrentOs(d); fetchOsDrafts(); }
-                                                            } catch (e) {}
-                                                        }} className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-xs font-medium whitespace-nowrap" title="Abrir a OS para ver serviços/peças, executar e registrar o teste"><i className="ph-bold ph-wrench"></i> Abrir OS</button>`}
-                                                        <button onClick=${() => puxarOportunidadeParaLaudo(o.nCodOp)} disabled=${puxandoCrm === o.nCodOp} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-xs font-medium whitespace-nowrap disabled:bg-slate-400">
-                                                            ${puxandoCrm === o.nCodOp ? html`<i className="ph ph-spinner animate-spin"></i> Carregando...` : html`<i className="ph-bold ph-file-text"></i> Carregar laudo`}
-                                                        </button>
-                                                    </div>
-                                                </td>
-                                            </tr>
-                                        `})}
+                                            </tr>`;
+                                        })}
                                     </tbody>
                                 </table>
                             </div>
@@ -9398,8 +8860,8 @@ HTML_PAGE = """
             // Depois de "Finalizar serviço", o equipamento cai aqui pra ser testado. O técnico
             // roda o checklist de testes (lista global, o admin edita em Templates), escreve a
             // observação e decide: REPROVA (motivo obrigatório -> volta pra bancada) ou LIBERA
-            // (o backend exige execEstado='aprovado' e aí o crm-finalizar move a oportunidade
-            // pra "04 Finalizadas" no Omie e registra o teste nas observações de lá).
+            // (o backend exige execEstado='aprovado' e aí o painel-finalizar move o cartão
+            // do painel para "Finalizado").
             const testeSalvarCampos = async (osId, patch) => {
                 try {
                     await fetch(`/api/os/${osId}/exec-checklist`, {
@@ -9455,8 +8917,8 @@ HTML_PAGE = """
                     });
                     const d = await r.json();
                     if (!d || !d.id) { alert('Erro: ' + ((d && d.error) || 'falha ao aprovar')); return; }
-                    // Aprovado -> agora o crm-finalizar aceita mover a fase no Omie.
-                    const r2 = await fetch(`/api/os/${o.id}/crm-finalizar`, {
+                    // Aprovado -> o painel-finalizar move o cartão do painel para Finalizado.
+                    const r2 = await fetch(`/api/os/${o.id}/painel-finalizar`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
                         body: JSON.stringify({})
@@ -9466,10 +8928,10 @@ HTML_PAGE = """
                     fetchOsDrafts();
                     if (d2 && d2.success) {
                         alert('Equipamento liberado!' + (d2.faseMovida
-                            ? `\\n\\nOportunidade movida para "${d2.faseNova || '04 Finalizadas'}" no Omie.`
-                            : `\\n\\nATENÇÃO: ${d2.warning || 'a fase no Omie não foi movida — verifique.'}`));
+                            ? `\\n\\nCartão do painel movido para "${d2.faseNova || 'Finalizado'}".`
+                            : `\\n\\nATENÇÃO: ${d2.warning || 'o cartão do painel não foi movido — verifique.'}`));
                     } else {
-                        alert('Teste aprovado, mas falhou ao finalizar no Omie: ' + ((d2 && d2.error) || 'erro desconhecido'));
+                        alert('Teste aprovado, mas falhou ao atualizar o painel: ' + ((d2 && d2.error) || 'erro desconhecido'));
                     }
                     setActiveTab('historico');
                 } catch (e) { alert('Erro de rede: ' + (e.message || e)); }
@@ -9771,12 +9233,12 @@ HTML_PAGE = """
                                 <div>
                                     <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
                                         <i className="ph-fill ph-wrench text-orange-500 text-2xl"></i> Serviços a executar
-                                        <span className="text-sm font-normal text-slate-400">(${bancadaOps.length} em preparação)</span>
+                                        <span className="text-sm font-normal text-slate-400">(${bancadaOps.length} no painel)</span>
                                     </h2>
-                                    <p className="text-sm text-slate-500 mt-1">Oportunidades em "03 Em Preparação" no Omie. Marque cada serviço/peça conforme executar.</p>
+                                    <p className="text-sm text-slate-500 mt-1">Equipamentos em "Fila de Manutenção" e "Em Execução" no Painel de Manutenção. Marque cada serviço/peça conforme executar.</p>
                                 </div>
                                 <button onClick=${fetchBancada} disabled=${bancadaLoading} className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-1 disabled:opacity-50">
-                                    <i className=${`ph-bold ph-arrows-clockwise ${bancadaLoading ? 'animate-spin' : ''}`}></i> ${bancadaLoading ? 'Atualizando…' : 'Atualizar do Omie'}
+                                    <i className=${`ph-bold ph-arrows-clockwise ${bancadaLoading ? 'animate-spin' : ''}`}></i> ${bancadaLoading ? 'Atualizando…' : 'Atualizar'}
                                 </button>
                             </div>
                         </div>
@@ -9784,7 +9246,7 @@ HTML_PAGE = """
                         ${bancadaLoading && !bancadaOps.length ? html`
                             <div className="bg-white p-10 rounded-xl shadow-sm border border-slate-200 text-center text-slate-400">
                                 <i className="ph ph-spinner animate-spin text-4xl mb-2"></i>
-                                <p>Buscando as oportunidades em preparação no Omie…</p>
+                                <p>Buscando os equipamentos da bancada no painel…</p>
                             </div>
                         ` : !bancadaOps.length ? html`
                             <div className="bg-white p-10 rounded-xl shadow-sm border border-slate-200 text-center text-slate-400">
@@ -9795,10 +9257,13 @@ HTML_PAGE = """
                             const o = e.os;
                             if (!o) {
                                 return html`
-                                    <div key=${e.crmOpNum} className="bg-white rounded-xl shadow-sm border border-dashed border-amber-300 p-4">
+                                    <div key=${e.painelId} className="bg-white rounded-xl shadow-sm border border-dashed border-amber-300 p-4">
                                         <div className="font-semibold text-slate-800">${e.cliente || 'Sem cliente'}</div>
-                                        <div className="text-xs text-slate-500"><span className="font-mono">${e.crmOpNum}</span> · ${e.equipamento || 'Equipamento'}</div>
-                                        <p className="text-xs text-amber-600 mt-2"><i className="ph-bold ph-warning"></i> Esta oportunidade ainda não tem OS no app — abra-a na aba CRM e gere a OS para executar aqui.</p>
+                                        <div className="text-xs text-slate-500">${e.osNum ? html`OS <span className="font-mono">${e.osNum}</span> · ` : ''}${e.equipamento || 'Equipamento'}${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}</div>
+                                        ${e.osNum ? html`
+                                            <button onClick=${() => abrirOsDoPainel(e.osNum)} disabled=${puxandoOs === e.osNum} className="mt-2 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-60">
+                                                ${puxandoOs === e.osNum ? 'Abrindo…' : 'Abrir OS ' + e.osNum + ' do Omie'}
+                                            </button>` : html`<p className="text-xs text-amber-600 mt-2"><i className="ph-bold ph-warning"></i> Este cartão do painel ainda não tem o nº da OS — peça ao vendedor para preenchê-lo.</p>`}
                                     </div>`;
                             }
                             const prog = execProgresso(o);
@@ -9812,7 +9277,6 @@ HTML_PAGE = """
                                         <div className="min-w-0">
                                             <div className="font-semibold text-slate-800 truncate">${e.cliente || (o.client && o.client.name) || 'Sem cliente'}</div>
                                             <div className="text-xs text-slate-500 truncate">
-                                                ${e.crmOpNum ? html`<span className="font-mono">${e.crmOpNum}</span> · ` : ''}
                                                 ${e.equipamento || (o.fromLaudo && o.fromLaudo.model) || 'Equipamento'}
                                                 ${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}
                                                 ${o.omieOsNumber ? html` · OS ${o.omieOsNumber}` : ''}
@@ -9991,7 +9455,7 @@ HTML_PAGE = """
                     const verValores = auth.role === 'admin';
                     // Só faz sentido "Corrigir" (refaturar pelo robô) uma OS enviada, vinculada a
                     // uma oportunidade, e faturada pelo robô (sem NF-e emitida, docs abertos no Omie).
-                    const podeCorrigir = currentOs.status === 'sent' && currentOs.crmOpNum;
+                    const podeCorrigir = currentOs.status === 'sent' && currentOs.omieOsNumber;
                     const salvarCorrecao = async () => {
                         if (!confirm('Salvar a correção?\\n\\nIMPORTANTE: exclua o PV/OS ANTIGO no Omie ANTES de salvar (é documento aberto, sem NF-e). Ao salvar, a OS volta para a fila e o robô GERA os documentos corrigidos.\\n\\nSe o doc antigo ainda existir, o robô espera e NÃO duplica.\\n\\nJá pode salvar?')) return;
                         setSalvandoCorrecao(true);
@@ -10014,7 +9478,7 @@ HTML_PAGE = """
                     };
 
                     // ---- Execução & Teste (fase "03 Em Preparação") ----
-                    const emPreparacao = currentOs.crmFaseCodigo === 10843780552;
+                    const emPreparacao = ['fila', 'exec'].includes(currentOs.painelCol);
                     const execEstado = currentOs.execEstado || 'a_executar';
                     // Checklist de execução (serviços feitos / peças trocadas) — informativo.
                     const toggleChecklist = async (tipo, idx) => {
@@ -10053,20 +9517,20 @@ HTML_PAGE = """
                         finally { setExecSalvando(false); }
                     };
                     const enviarParaFinalizadas = async () => {
-                        if (!confirm('Confirmar aprovação no teste e enviar a oportunidade para "04 Finalizadas"?')) return;
+                        if (!confirm('Confirmar aprovação no teste e mover o cartão do painel para "Finalizado"?')) return;
                         setExecSalvando(true);
                         try {
-                            const r = await fetch(`/api/os/${currentOs.id}/crm-finalizar`, {
+                            const r = await fetch(`/api/os/${currentOs.id}/painel-finalizar`, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', 'Authorization': auth.token }
                             });
                             const d = await r.json();
                             if (d.success) {
-                                let msg = 'Oportunidade enviada para Finalizadas!';
+                                let msg = 'Cartão do painel movido para Finalizado!';
                                 if (d.faseMovida) msg += `\\n\\nFase: ${d.faseNova}`;
                                 if (d.warning) msg += `\\n\\n⚠️ ${d.warning}`;
                                 alert(msg);
-                                setCurrentOs(prev => prev ? { ...prev, crmFaseCodigo: d.faseMovida ? 10843780553 : prev.crmFaseCodigo } : prev);
+                                setCurrentOs(prev => prev ? { ...prev, painelCol: d.faseMovida ? 'final' : prev.painelCol } : prev);
                                 fetchOsDrafts();
                             } else {
                                 alert('Erro: ' + (d.error || 'falha ao enviar para Finalizadas'));
@@ -10083,7 +9547,7 @@ HTML_PAGE = """
                                     <h2 className="text-xl font-bold text-slate-800 mt-1 flex items-center gap-2">
                                         <i className="ph-fill ph-clipboard-text text-indigo-600 text-2xl"></i>
                                         ${corrigindo
-                                            ? `Corrigindo OS ${currentOs.crmOpNum || ('#' + (currentOs.omieOsNumber || currentOs.omieOsId || ''))} — vai refaturar`
+                                            ? `Corrigindo OS ${currentOs.omieOsNumber || ('#' + (currentOs.omieOsId || ''))} — vai refaturar`
                                             : (isLocked
                                                 ? `OS #${currentOs.omieOsNumber || currentOs.omieOsId} (enviada)`
                                                 : (currentOs.status === 'imported'
@@ -10117,7 +9581,7 @@ HTML_PAGE = """
                                         </button>
                                         <button onClick=${() => { setCorrigindo(false); abrirOsCompleta(currentOs); }} className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded font-medium">Cancelar</button>
                                     `}
-                                    ${(isLocked || currentOs.status === 'imported') && (currentOs.omieOsId || currentOs.crmOpId) && html`
+                                    ${(isLocked || currentOs.status === 'imported') && currentOs.omieOsId && html`
                                         <button onClick=${anexarLaudoPDF} className=${`px-4 py-2 rounded font-medium flex items-center gap-1 text-white ${currentOs.pdfAnexado ? 'bg-slate-500 hover:bg-slate-600' : 'bg-purple-600 hover:bg-purple-700'}`}>
                                             <i className="ph-bold ph-paperclip"></i> ${currentOs.pdfAnexado ? 'Re-anexar Laudo' : 'Anexar PDF do Laudo'}
                                         </button>
@@ -10710,7 +10174,7 @@ HTML_PAGE = """
                             </button>
                             <button onClick=${() => setActiveTab('historico')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'historico' ? 'bg-white text-emerald-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clock-counter-clockwise"></i> Histórico</button>
                             <button onClick=${() => { setActiveTab('os'); setCurrentOs(null); }} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'os' ? 'bg-white text-indigo-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-clipboard-text"></i> Ordens de Serviço</button>
-                            <button onClick=${() => setActiveTab('crm')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'crm' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-funnel"></i> Oportunidades (CRM)</button>
+                            <button onClick=${() => setActiveTab('analises')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'analises' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-magnifying-glass"></i> Aguardando Análise</button>
                             <a data-keep="1" href="/painel/" className="whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all text-slate-600 hover:bg-slate-300"><i className="ph-bold ph-kanban"></i> Painel de Manutenção</a>
 
                             <button data-keep="1" onClick=${() => setActiveTab('requisicoes')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'requisicoes' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
@@ -10735,7 +10199,7 @@ HTML_PAGE = """
                             ${activeTab === 'teste' ? renderTesteLiberacao() : ''}
                             ${activeTab === 'historico' ? renderHistorico() : ''}
                             ${activeTab === 'os' ? renderOS() : ''}
-                            ${activeTab === 'crm' ? renderCRM() : ''}
+                            ${activeTab === 'analises' ? renderAnalises() : ''}
                             ${activeTab === 'requisicoes' ? renderRequisicoes() : ''}
                             ${activeTab === 'robo' && auth.role === 'admin' ? renderRobo() : ''}
                             ${activeTab === 'relatorios' && auth.role === 'admin' ? renderRelatorios() : ''}
