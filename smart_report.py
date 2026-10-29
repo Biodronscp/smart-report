@@ -5659,6 +5659,8 @@ HTML_PAGE = """
             const [bancadaLoading, setBancadaLoading] = useState(false);
             const [testeOps, setTesteOps] = useState([]);          // cartões do painel em Teste de Equipamento
             const [testeLoading, setTesteLoading] = useState(false);
+            const [testeBusca, setTesteBusca] = useState('');       // pesquisa em Teste e Liberação (nº da OS ou cliente)
+            const [bancadaBusca, setBancadaBusca] = useState('');   // pesquisa em Serviços a executar
             // Aba "Teste e Liberação" (execEstado === 'aguardando_teste')
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
@@ -9128,23 +9130,26 @@ HTML_PAGE = """
 
             const renderTesteLiberacao = () => {
                 // Fonte: cartões do painel em Teste de Equipamento. A OS do Smart vem de osDrafts (estado vivo do checklist).
-                const lista = (testeOps || []).map(e => ({ e, o: e.osId ? ((osDrafts || []).find(d => d.id === e.osId) || e.os) : null }));
+                const lista = (testeOps || []).filter(e => casaBusca(testeBusca, e.osNum, e.cliente, e.equipamento, e.serie))
+                    .map(e => ({ e, o: e.osId ? ((osDrafts || []).find(d => d.id === e.osId) || e.os) : null }));
                 const itens = testesChecklist || [];
                 return html`
                     <div className="space-y-4">
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
                             <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
                                 <i className="ph-fill ph-test-tube text-cyan-500 text-2xl"></i> Teste e Liberação
-                                <span className="text-sm font-normal text-slate-400">(${lista.length} aguardando teste)</span>
+                                <span className="text-sm font-normal text-slate-400">(${lista.length}${testeBusca.trim() ? ' de ' + (testeOps || []).length : ''} aguardando teste)</span>
                                 <button onClick=${fetchTeste} disabled=${testeLoading} className="ml-auto bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1 disabled:opacity-50"><i className=${`ph-bold ph-arrows-clockwise ${testeLoading ? 'animate-spin' : ''}`}></i> Atualizar</button>
                             </h2>
                             <p className="text-sm text-slate-500 mt-1">Equipamentos em "Teste de Equipamento" no Painel de Manutenção, aguardando o teste final antes de liberar.</p>
                         </div>
 
+                        ${(testeOps || []).length ? campoBusca(testeBusca, setTesteBusca, testeOps.length, lista.length) : ''}
+
                         ${!lista.length ? html`
                             <div className="bg-white p-10 rounded-xl shadow-sm border border-slate-200 text-center text-slate-400">
                                 <i className="ph ph-check-circle text-5xl mb-2"></i>
-                                <p>Nenhum equipamento aguardando teste.</p>
+                                <p>${testeBusca.trim() ? 'Nenhuma OS encontrada para a pesquisa.' : 'Nenhum equipamento aguardando teste.'}</p>
                             </div>
                         ` : lista.map(({ e, o }) => {
                             if (!o) {
@@ -9430,6 +9435,23 @@ HTML_PAGE = """
                 } catch (e) { alert('Erro de rede: ' + (e.message || e)); }
             };
 
+            const semAcento = (t) => String(t == null ? '' : t).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+            // true se o termo aparece em algum dos campos (vazio = tudo passa)
+            const casaBusca = (termo, ...campos) => {
+                const t = semAcento(termo).trim();
+                return !t || campos.some(c => semAcento(c).includes(t));
+            };
+            const campoBusca = (valor, setValor, total, achados) => html`
+                <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                        <i className="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
+                        <input type="text" value=${valor} onChange=${ev => setValor(ev.target.value)} placeholder="Pesquisar por nº da OS ou nome do cliente…" className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm bg-white" />
+                    </div>
+                    ${valor.trim() ? html`
+                        <span className="text-xs text-slate-400 whitespace-nowrap">${achados} de ${total}</span>
+                        <button onClick=${() => setValor('')} className="text-slate-500 hover:text-slate-700 text-sm font-medium whitespace-nowrap">Limpar</button>` : ''}
+                </div>`;
+
             // "Puxar para execução": pergunta se o técnico vai executar o serviço. Sim -> a OS passa para "Em Execução"
             // no Smart (traz a OS do Omie se ainda não estiver aqui) e no painel.
             const iniciarExecucaoBancada = async (e) => {
@@ -9450,8 +9472,9 @@ HTML_PAGE = """
             };
 
             const renderServicosExecutar = () => {
-                const aprovadas = bancadaOps.filter(e => e.painelCol !== 'exec');   // Fila de Manutenção (aprovadas)
-                const emExecucao = bancadaOps.filter(e => e.painelCol === 'exec');   // Em Execução
+                const visiveis = bancadaOps.filter(e => casaBusca(bancadaBusca, e.osNum, e.cliente, e.equipamento, e.serie));
+                const aprovadas = visiveis.filter(e => e.painelCol !== 'exec');   // Fila de Manutenção (aprovadas)
+                const emExecucao = visiveis.filter(e => e.painelCol === 'exec');   // Em Execução
                 const cardBancada = (e) => {
                     const o = e.os;
                     if (!o) {
@@ -9610,6 +9633,8 @@ HTML_PAGE = """
                             </div>
                         </div>
 
+                        ${bancadaOps.length ? campoBusca(bancadaBusca, setBancadaBusca, bancadaOps.length, visiveis.length) : ''}
+
                         ${bancadaLoading && !bancadaOps.length ? html`
                             <div className="bg-white p-10 rounded-xl shadow-sm border border-slate-200 text-center text-slate-400">
                                 <i className="ph ph-spinner animate-spin text-4xl mb-2"></i>
@@ -9632,14 +9657,14 @@ HTML_PAGE = """
                                         <div className="flex justify-end mt-1">
                                             <button onClick=${() => iniciarExecucaoBancada(e)} disabled=${puxandoOs === e.osNum} className="bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1"><i className="ph-bold ph-play"></i> Puxar para execução</button>
                                         </div>
-                                    </div>`) : html`<div className="bg-white p-6 rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-400">Nenhuma manutenção aprovada aguardando.</div>`}
+                                    </div>`) : html`<div className="bg-white p-6 rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-400">${bancadaBusca.trim() ? 'Nenhuma OS encontrada para a pesquisa.' : 'Nenhuma manutenção aprovada aguardando.'}</div>`}
                             </div>
                             <div className="space-y-3">
                                 <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wide flex items-center gap-2">
                                     <i className="ph-fill ph-wrench text-orange-500"></i> Em Execução
                                     <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">${emExecucao.length}</span>
                                 </h3>
-                                ${emExecucao.length ? emExecucao.map(e => html`<div key=${'ex_' + e.painelId}>${cardBancada(e)}</div>`) : html`<div className="bg-white p-6 rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-400">Nenhuma manutenção em execução.</div>`}
+                                ${emExecucao.length ? emExecucao.map(e => html`<div key=${'ex_' + e.painelId}>${cardBancada(e)}</div>`) : html`<div className="bg-white p-6 rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-400">${bancadaBusca.trim() ? 'Nenhuma OS encontrada para a pesquisa.' : 'Nenhuma manutenção em execução.'}</div>`}
                             </div>
                         `}
                     </div>`;
