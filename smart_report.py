@@ -115,7 +115,9 @@ _API_EXTRA_POR_PAPEL = {
 _API_GET_POR_PAPEL = {
     'almoxarife': ('/api/data', '/api/os'),
 }
-_PAPEL_CACHE = {}   # token -> (papel, válido até); evita reler o banco a cada chamada
+_PAPEL_CACHE = {}   # token -> (papel, senha_temporária, válido até); evita reler o banco a cada chamada
+_API_SEMPRE_LIVRE = ('/api/login', '/api/logout', '/api/logo', '/api/change-password', '/api/register', '/api/filiais-publicas')
+MSG_TROCAR_SENHA = "Troque a senha temporária antes de continuar."
 
 
 def _sem_permissao():
@@ -123,27 +125,32 @@ def _sem_permissao():
 
 
 @app.before_request
-def _restringe_papeis_fora_da_area():
+def _restringe_acesso():
+    """1) Senha temporária (resetada pelo admin): só deixa trocar a senha. 2) Papéis fora da área técnica só usam o que é deles."""
     path = request.path
-    if not path.startswith('/api/') or path.startswith(_API_LIVRE_RESTRITOS):
+    if not path.startswith('/api/') or path.startswith(_API_SEMPRE_LIVRE):
         return None
     token = request.headers.get('Authorization')
     if not token:
         return None
     agora = datetime.utcnow().timestamp()
     hit = _PAPEL_CACHE.get(token)
-    if hit and hit[1] > agora:
-        papel = hit[0]
+    if hit and hit[2] > agora:
+        papel, temporaria = hit[0], hit[1]
     else:
         fd = load_data()
         u = _resolve_token(fd, token)
         papel = (fd['users'][u].get('role') or 'user') if u else None
+        # a chave de API do robô nunca é bloqueada por senha temporária (não há ninguém para trocar)
+        temporaria = bool(u and token not in (fd.get('apiTokens') or {}) and fd['users'][u].get('mustResetPassword'))
         if len(_PAPEL_CACHE) > 500:
             _PAPEL_CACHE.clear()
-        _PAPEL_CACHE[token] = (papel, agora + 30)
-    if papel not in _API_EXTRA_POR_PAPEL:
+        _PAPEL_CACHE[token] = (papel, temporaria, agora + 30)
+    if temporaria:
+        return jsonify({"error": MSG_TROCAR_SENHA, "mustResetPassword": True}), 403
+    if path.startswith('/api/painel') or papel not in _API_EXTRA_POR_PAPEL:
         return None
-    if path.startswith(_API_EXTRA_POR_PAPEL[papel]) and _API_EXTRA_POR_PAPEL[papel]:
+    if _API_EXTRA_POR_PAPEL[papel] and path.startswith(_API_EXTRA_POR_PAPEL[papel]):
         return None
     if request.method == 'GET' and path in _API_GET_POR_PAPEL.get(papel, ()):
         return None
@@ -699,6 +706,7 @@ def change_password():
     u['passwordHash'] = hash_password(new)
     u['mustResetPassword'] = False
     save_data(full_data)
+    _PAPEL_CACHE.clear()
     return jsonify({"success": True})
 
 
@@ -1006,6 +1014,7 @@ def reset_password(username):
     temp = generate_temp_password()
     full_data['users'][username]['passwordHash'] = hash_password(temp)
     full_data['users'][username]['mustResetPassword'] = True
+    _PAPEL_CACHE.clear()
     save_data(full_data)
     return jsonify({"success": True, "tempPassword": temp})
 
@@ -5478,11 +5487,6 @@ HTML_PAGE = """
                 return stored ? JSON.parse(stored) : null;
             });
 
-            // Vendedor e Expedição só usam o Painel de Manutenção (Smart = login único)
-            if (auth && (auth.role === 'vendedor' || auth.role === 'expedicao') && !location.pathname.startsWith('/painel')) {
-                location.replace('/painel/');
-            }
-
             // Tabs e UX
             const soRequisicoes = !!(auth && auth.role === 'almoxarife');   // Almoxarife: só Requisições + Painel
             const [activeTab, setActiveTab] = useState(soRequisicoes ? 'requisicoes' : 'report');
@@ -5494,7 +5498,9 @@ HTML_PAGE = """
             const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
             const [registerMsg, setRegisterMsg] = useState({ type: '', text: '' });
             const [regPerfil, setRegPerfil] = useState('');   // perfil que a pessoa aponta ao se cadastrar
-            const [mustChangePwd, setMustChangePwd] = useState(false);
+            const [mustChangePwd, setMustChangePwd] = useState(() => {   // senha temporária pendente (sobrevive a recarregar)
+                try { const a = JSON.parse(localStorage.getItem('smartReportAuth') || 'null'); return !!(a && a.mustResetPassword); } catch (e) { return false; }
+            });
             const [pwdChangeMsg, setPwdChangeMsg] = useState("");
             const [tempPasswordInfo, setTempPasswordInfo] = useState(null); // {username, password}
             const [analises, setAnalises] = useState(null);          // cartões do painel em Aguardando Análise
@@ -6513,7 +6519,7 @@ HTML_PAGE = """
                     body: JSON.stringify({ username, password })
                 }).then(r => r.json().then(data => ({status: r.status, data}))).then(({status, data}) => {
                     if (data.success) {
-                        const newAuth = { token: data.token, username: data.username, role: data.role, firstName: data.firstName, lastName: data.lastName, filialId: data.filialId, filialIds: data.filialIds || [], filiais: data.filiais || [] };
+                        const newAuth = { token: data.token, username: data.username, role: data.role, firstName: data.firstName, lastName: data.lastName, filialId: data.filialId, filialIds: data.filialIds || [], filiais: data.filiais || [], mustResetPassword: !!data.mustResetPassword };
                         localStorage.setItem('smartReportAuth', JSON.stringify(newAuth));
                         setAuth(newAuth);
                         if (data.mustResetPassword) setMustChangePwd(true);
@@ -6578,6 +6584,10 @@ HTML_PAGE = """
                     body: JSON.stringify({ currentPassword: f.currentPassword.value, newPassword: f.newPassword.value })
                 }).then(r => r.json()).then(data => {
                     if (data.success) {
+                        try {
+                            const a = JSON.parse(localStorage.getItem('smartReportAuth') || 'null');
+                            if (a) { delete a.mustResetPassword; localStorage.setItem('smartReportAuth', JSON.stringify(a)); setAuth(a); }
+                        } catch (e) {}
                         setMustChangePwd(false);
                         f.reset();
                         setPwdChangeMsg("");
@@ -6766,6 +6776,11 @@ HTML_PAGE = """
                         </div>
                     </div>
                 `;
+            }
+
+            // Vendedor e Expedição só usam o Painel de Manutenção (Smart = login único). Vão pra lá depois da troca de senha obrigatória.
+            if (auth && !mustChangePwd && (auth.role === 'vendedor' || auth.role === 'expedicao') && !location.pathname.startsWith('/painel')) {
+                location.replace('/painel/');
             }
 
             if (!isLoaded) return html`<div className="flex justify-center items-center h-screen text-xl font-bold text-slate-500"><i className="ph ph-spinner animate-spin mr-2"></i> Carregando dados do usuário...</div>`;

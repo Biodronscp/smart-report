@@ -103,6 +103,7 @@ async function api(caminho, corpo, metodo) {
     body: corpo === undefined ? undefined : JSON.stringify(corpo)
   });
   let d = null; try { d = await r.json(); } catch (e) {}
+  if (r.status === 403 && d && d.mustResetPassword) { location.href = "/"; }   // senha temporária: o Smart pede a troca
   if (!r.ok) { const e = new Error((d && d.error) || ("Erro " + r.status)); e.status = r.status; throw e; }
   return d;
 }
