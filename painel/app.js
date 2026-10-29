@@ -112,6 +112,8 @@ function linhaParaCard(r) {
   CAMPOS_OS.forEach(k => { const v = r[k]; c[k] = v == null ? "" : v; });
   c.valorProposta = r.valorProposta || "";
   c.valorBase = r.valorBase || "";
+  c.condenado = !!r.condenado;          // condenado no teste (sem reparo): só exibição
+  c.motivoCondenado = r.motivoCondenado || "";
   return c;
 }
 async function carregar(avisar, imediato) {
@@ -319,6 +321,7 @@ function visiveis() {
 function cardHtml(c) {
   const i = info(c);
   const gar = c.garantia === "Sim" ? '<span class="tag warn">Garantia</span> ' : c.garantia === "Condenado" ? '<span class="tag">Condenado</span> ' : "";
+  const cond = c.condenado ? `<span class="tag late" title="${esc(c.motivoCondenado)}">Condenado no teste</span> ` : "";
   let prazoTxt = "";
   if (i.atrasado) prazoTxt = `<span class="tag late">⚠ Atrasada${i.diasAtraso ? " · " + i.diasAtraso + " d.u." : ""}</span>`;
   else if (i.limite) prazoTxt = `<span class="tag">Prazo: ${fmt(i.limite)}</span>`;
@@ -327,7 +330,7 @@ function cardHtml(c) {
     <h3><span>${esc(c.equipamento)} ${esc(c.modelo)}</span>${ico}</h3>
     <p>${esc(c.cliente || "Cliente não informado")}</p>
     <p>Série: ${esc(c.serie)}</p>
-    <div>${gar}${prazoTxt}</div>
+    <div>${gar}${cond}${prazoTxt}</div>
     <div class="foot"><span>${c.os ? "OS " + esc(c.os) : "Sem OS"}</span><span>${esc(i.status)}</span></div>
   </div>`;
 }

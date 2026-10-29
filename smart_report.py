@@ -2896,6 +2896,43 @@ def painel_iniciar_execucao(oid):
     return jsonify({"success": True, "col": "exec"})
 
 
+@app.route('/api/painel/<oid>/condenar', methods=['POST'])
+def painel_condenar(oid):
+    """Teste reprovado e SEM reparo: encerra o teste e leva o cartão para 'Finalizado', marcado como Condenado.
+    Não mexe na garantia do cartão (Sim/Não); a marca fica em condenado/motivoCondenado. Body: {motivo}."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    perfil = _painel_perfil(full_data, user)
+    o = p['ordens'].get(oid)
+    vis = _painel_colunas_visiveis(p, perfil)
+    if not o or (vis is not None and o.get('col') not in vis):
+        return jsonify({"error": "OS não encontrada"}), 404
+    if perfil not in ('admin', 'manutencao'):
+        return _sem_permissao()
+    if o.get('col') != 'teste':
+        return jsonify({"error": "Só dá para condenar um equipamento que está em Teste de Equipamento."}), 400
+    motivo = str((request.json or {}).get('motivo') or '').strip()[:300]
+    if not motivo:
+        return jsonify({"error": "Informe o motivo da condenação."}), 400
+    agora = datetime.utcnow().isoformat() + "Z"
+    if not o.get('dFinalizado'):
+        o['dFinalizado'] = datetime.now().strftime('%Y-%m-%d')
+    o.update({"col": "final", "condenado": True, "motivoCondenado": motivo, "condenadoEm": agora, "condenadoPor": user,
+              "atualizadoEm": agora, "atualizadoPor": user})
+    num = str(o.get('os') or '').strip()
+    for _owner, d in _all_filial_drafts(full_data, user):   # a OS do Smart: teste encerrado como condenada
+        if num and str(d.get('omieOsNumber') or '').strip() == num:
+            d['execEstado'] = 'condenado'
+            d['execMotivoCondenado'] = motivo
+            d['execTestadoAt'] = agora
+            d['updatedAt'] = agora
+    _painel_bump(p)
+    save_data(full_data)
+    return jsonify({"success": True, "col": "final"})
+
+
 @app.route('/api/painel/ordem/<oid>', methods=['DELETE'])
 def painel_excluir_ordem(oid):
     user, full_data, err = _require_user()
@@ -3318,7 +3355,7 @@ def os_bancada():
         escolha_owner, escolha = None, None
         if ativos:
             escolha_owner, escolha = max(ativos, key=lambda od: od[1].get('createdAt') or '')
-        elif candidatos and any((d.get('execEstado') or 'a_executar') in ('aguardando_teste', 'aprovado') for _o, d in candidatos):
+        elif candidatos and any((d.get('execEstado') or 'a_executar') in ('aguardando_teste', 'aprovado', 'condenado') for _o, d in candidatos):
             continue   # já foi pro teste/liberação -> some da bancada
         equip = ' '.join(x for x in (o.get('equipamento'), o.get('modelo')) if x)
         entry = {
@@ -5626,6 +5663,7 @@ HTML_PAGE = """
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
             const [testeReprovando, setTesteReprovando] = useState(false);
+            const [testeCondenando, setTesteCondenando] = useState(false);
             const [testeLiberando, setTesteLiberando] = useState(false);
             const [currentOs, setCurrentOs] = useState(null);
             const [corrigindo, setCorrigindo] = useState(false);   // modo "Corrigir OS" (destrava OS enviada p/ refaturar)
@@ -9034,6 +9072,27 @@ HTML_PAGE = """
                 finally { setTesteReprovando(false); }
             };
 
+            // Teste não passou e o equipamento não tem reparo: encerra o teste e o cartão vai para Finalizado (marcado Condenado).
+            const testeCondenar = async (e, o) => {
+                const motivo = (testeMotivo || '').trim();
+                if (!motivo) { alert('Escreva o motivo da condenação (por que não tem reparo).'); return; }
+                if (!confirm('Condenar o equipamento?\\n\\nSem possibilidade de reparo: o teste é finalizado e o cartão vai para "Finalizado" no painel, marcado como Condenado.\\n\\nMotivo: ' + motivo)) return;
+                setTesteCondenando(true);
+                try {
+                    await testeSalvarCampos(o.id, { obsTeste: o.obsTeste || '' });
+                    const d = await fetch(`/api/painel/${e.painelId}/condenar`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ motivo })
+                    }).then(r => r.json());
+                    if (!d.success) { alert('Erro: ' + (d.error || 'falha ao condenar')); return; }
+                    setTesteMotivo(''); setTesteAbertaId(null);
+                    fetchTeste(); fetchOsDrafts();
+                    alert('Equipamento condenado. O teste foi finalizado e o cartão foi para "Finalizado" no painel.');
+                } catch (err) { alert('Erro de rede: ' + (err.message || err)); }
+                finally { setTesteCondenando(false); }
+            };
+
             const testeLiberar = async (o) => {
                 if (!confirm('Liberar o equipamento?\\n\\nO teste será registrado como APROVADO e o cartão do painel vai para "Finalizado".')) return;
                 setTesteLiberando(true);
@@ -9145,8 +9204,8 @@ HTML_PAGE = """
 
                                             ${testeReprovando || !aberta ? '' : html`
                                                 <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                                                    <label className="text-xs font-bold text-red-700 uppercase block mb-1">Se o teste NÃO passou, escreva o motivo</label>
-                                                    <textarea value=${testeMotivo} onInput=${e => setTesteMotivo(e.target.value)} rows="2" placeholder="O que deu errado? (obrigatório para reprovar)" className="w-full p-2 border border-red-300 rounded text-sm outline-none focus:ring-2 focus:ring-red-400"></textarea>
+                                                    <label className="text-xs font-bold text-red-700 uppercase block mb-1">Se o teste NÃO passou, escreva o motivo (vale para reprovar ou condenar)</label>
+                                                    <textarea value=${testeMotivo} onInput=${e => setTesteMotivo(e.target.value)} rows="2" placeholder="O que deu errado? (obrigatório para reprovar ou condenar)" className="w-full p-2 border border-red-300 rounded text-sm outline-none focus:ring-2 focus:ring-red-400"></textarea>
                                                 </div>
                                             `}
 
@@ -9154,11 +9213,15 @@ HTML_PAGE = """
                                                 <button onClick=${() => testeReprovar(o)} disabled=${testeReprovando || !testeMotivo.trim()} className="bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2">
                                                     <i className="ph-bold ph-arrow-u-left-back"></i> ${testeReprovando ? 'Reprovando…' : 'Reprovar e voltar p/ execução'}
                                                 </button>
+                                                ${e.painelId ? html`
+                                                    <button onClick=${() => testeCondenar(e, o)} disabled=${testeCondenando || !testeMotivo.trim()} title="Teste não passou e não tem reparo: finaliza o teste e o cartão vai para Finalizado, marcado como Condenado" className="bg-slate-800 hover:bg-slate-900 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2">
+                                                        <i className="ph-bold ph-prohibit"></i> ${testeCondenando ? 'Condenando…' : 'Condenar equipamento'}
+                                                    </button>` : ''}
                                                 <button onClick=${() => testeLiberar(o)} disabled=${testeLiberando} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2 shadow-md">
                                                     <i className="ph-bold ph-seal-check"></i> ${testeLiberando ? 'Liberando…' : 'Aprovar e liberar'}
                                                 </button>
                                             </div>
-                                            <p className="text-xs text-slate-400 text-center">Aprovar move o cartão do painel para "Finalizado".</p>
+                                            <p className="text-xs text-slate-400 text-center">Aprovar ou condenar move o cartão do painel para "Finalizado" (condenado fica marcado).</p>
                                         </div>
                                     `}
                                 </div>`;
@@ -9169,7 +9232,7 @@ HTML_PAGE = """
             // ---- Aba "Histórico" (equipamentos liberados) ----------------------------
             const renderHistorico = () => {
                 const lista = (osDrafts || [])
-                    .filter(o => o.execEstado === 'aprovado')
+                    .filter(o => o.execEstado === 'aprovado' || o.execEstado === 'condenado')
                     .sort((a, b) => (b.execTestadoAt || '').localeCompare(a.execTestadoAt || ''));
                 const itens = testesChecklist || [];
                 const dataBr = (iso) => { try { return new Date(iso).toLocaleString('pt-BR'); } catch (e) { return iso || '—'; } };
@@ -9178,7 +9241,7 @@ HTML_PAGE = """
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
                             <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
                                 <i className="ph-fill ph-clock-counter-clockwise text-emerald-600 text-2xl"></i> Histórico
-                                <span className="text-sm font-normal text-slate-400">(${lista.length} liberados)</span>
+                                <span className="text-sm font-normal text-slate-400">(${lista.length} liberados/condenados)</span>
                             </h2>
                             <p className="text-sm text-slate-500 mt-1">Equipamentos com teste aprovado e liberados.</p>
                         </div>
@@ -9206,7 +9269,7 @@ HTML_PAGE = """
                                         </div>
                                         <div className="flex items-center gap-3 flex-shrink-0">
                                             <span className="text-xs text-slate-400 whitespace-nowrap hidden md:inline">${dataBr(o.execTestadoAt)}</span>
-                                            <span className="text-xs font-bold px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">Liberado</span>
+                                            ${o.execEstado === 'condenado' ? html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-slate-800 text-white">Condenado</span>` : html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">Liberado</span>`}
                                             <i className=${`ph-bold ${aberta ? 'ph-caret-up' : 'ph-caret-down'} text-slate-400`}></i>
                                         </div>
                                     </button>
@@ -9214,6 +9277,7 @@ HTML_PAGE = """
                                         <div className="border-t border-slate-200 p-4 space-y-3 text-sm">
                                             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-slate-500">
                                                 <div><b>Serviço concluído:</b> ${dataBr(o.execConcluidaAt)}</div>
+                                                ${o.execEstado === 'condenado' ? html`<div className="md:col-span-2 text-slate-800"><b>Condenado — sem reparo:</b> ${o.execMotivoCondenado || '—'}</div>` : ''}
                                                 <div><b>Teste aprovado:</b> ${dataBr(o.execTestadoAt)}</div>
                                                 ${o.crmFinalizadoAt ? html`<div><b>Finalizado no Omie:</b> ${dataBr(o.crmFinalizadoAt)}</div>` : ''}
                                             </div>
