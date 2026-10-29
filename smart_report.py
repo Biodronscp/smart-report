@@ -5908,6 +5908,21 @@ HTML_PAGE = """
                 }
             }, [activeTab, auth]);
 
+            // As listas que vêm do Painel (Serviços a executar, Teste e Liberação, Aguardando Análise e o selo da aba) mudam quando
+            // OUTRAS pessoas movem cartões no painel: atualiza sozinho a cada 20 s e ao voltar para esta janela.
+            useEffect(() => {
+                if (!auth || ['vendedor', 'expedicao', 'almoxarife'].includes(auth.role)) return;   // esses papéis não usam essas telas
+                const atualizar = () => {
+                    if (document.hidden) return;
+                    fetchTeste();   // também alimenta o selo da aba
+                    if (activeTab === 'executar') fetchBancada();
+                    if (activeTab === 'analises') fetchAnalises();
+                };
+                const id = setInterval(atualizar, 20000);
+                document.addEventListener('visibilitychange', atualizar);
+                return () => { clearInterval(id); document.removeEventListener('visibilitychange', atualizar); };
+            }, [auth, activeTab]);
+
             // Requisições de peças: carrega ao logar (pro selo da aba) e atualiza sozinho
             // (20s com a aba aberta, 90s em segundo plano).
             useEffect(() => {
