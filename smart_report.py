@@ -5661,6 +5661,8 @@ HTML_PAGE = """
             const [testeLoading, setTesteLoading] = useState(false);
             const [testeBusca, setTesteBusca] = useState('');       // pesquisa em Teste e Liberação (nº da OS ou cliente)
             const [bancadaBusca, setBancadaBusca] = useState('');   // pesquisa em Serviços a executar
+            const [histBusca, setHistBusca] = useState('');         // pesquisa no Histórico
+            const [osBusca, setOsBusca] = useState('');             // pesquisa em Ordens de Serviço
             // Aba "Teste e Liberação" (execEstado === 'aguardando_teste')
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
@@ -9236,8 +9238,9 @@ HTML_PAGE = """
 
             // ---- Aba "Histórico" (equipamentos liberados) ----------------------------
             const renderHistorico = () => {
-                const lista = (osDrafts || [])
-                    .filter(o => o.execEstado === 'aprovado' || o.execEstado === 'condenado')
+                const todosHist = (osDrafts || []).filter(o => o.execEstado === 'aprovado' || o.execEstado === 'condenado');
+                const lista = todosHist
+                    .filter(o => casaBusca(histBusca, o.omieOsNumber, o.crmOpNum, o.client && o.client.name, o.fromLaudo && o.fromLaudo.model, o.fromLaudo && o.fromLaudo.serial))
                     .sort((a, b) => (b.execTestadoAt || '').localeCompare(a.execTestadoAt || ''));
                 const itens = testesChecklist || [];
                 const dataBr = (iso) => { try { return new Date(iso).toLocaleString('pt-BR'); } catch (e) { return iso || '—'; } };
@@ -9246,15 +9249,17 @@ HTML_PAGE = """
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
                             <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
                                 <i className="ph-fill ph-clock-counter-clockwise text-emerald-600 text-2xl"></i> Histórico
-                                <span className="text-sm font-normal text-slate-400">(${lista.length} liberados/condenados)</span>
+                                <span className="text-sm font-normal text-slate-400">(${lista.length}${histBusca.trim() ? ' de ' + todosHist.length : ''} liberados/condenados)</span>
                             </h2>
                             <p className="text-sm text-slate-500 mt-1">Equipamentos com teste aprovado e liberados.</p>
                         </div>
 
+                        ${todosHist.length ? campoBusca(histBusca, setHistBusca, todosHist.length, lista.length) : ''}
+
                         ${!lista.length ? html`
                             <div className="bg-white p-10 rounded-xl shadow-sm border border-slate-200 text-center text-slate-400">
                                 <i className="ph ph-archive text-5xl mb-2"></i>
-                                <p>Nenhum equipamento liberado ainda.</p>
+                                <p>${histBusca.trim() ? 'Nenhuma OS encontrada para a pesquisa.' : 'Nenhum equipamento liberado ainda.'}</p>
                             </div>
                         ` : lista.map(o => {
                             const aberta = testeAbertaId === 'h_' + o.id;
@@ -10266,6 +10271,7 @@ HTML_PAGE = """
                                         <button key=${key} onClick=${() => setOsFilter(key)} className=${`px-3 py-1.5 rounded-full font-medium border ${osFilter===key ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>${label} <span className=${`ml-1 px-1.5 rounded-full text-xs ${osFilter===key?'bg-white/25':'bg-slate-200 text-slate-700'}`}>${count}</span></button>
                                     `)}
                                 </div>
+                                <div className="mb-3">${campoBusca(osBusca, setOsBusca, osDrafts.length, osDrafts.filter(o => casaBusca(osBusca, o.omieOsNumber, o.omieOsId, o.client && o.client.name)).length)}</div>
                                 <div className="overflow-x-auto">
                                     <table className="min-w-full text-sm">
                                         <thead className="bg-slate-100 text-slate-700">
@@ -10280,7 +10286,7 @@ HTML_PAGE = """
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-100">
-                                            ${osDrafts.filter(o => osFilter==='todas' || (osFilter==='enviadas' && o.status==='sent') || (osFilter==='pendentes' && o.status!=='sent')).map(o => html`
+                                            ${osDrafts.filter(o => casaBusca(osBusca, o.omieOsNumber, o.omieOsId, o.client && o.client.name)).filter(o => osFilter==='todas' || (osFilter==='enviadas' && o.status==='sent') || (osFilter==='pendentes' && o.status!=='sent')).map(o => html`
                                                 <tr key=${o.id} className="hover:bg-slate-50">
                                                     <td className="p-3 text-xs">${new Date(o.createdAt).toLocaleString('pt-BR')}${o.sentAt ? html`<div className="text-green-600">enviada ${new Date(o.sentAt).toLocaleString('pt-BR')}</div>` : ''}</td>
                                                     <td className="p-3">${o.client?.name || '(sem cliente)'}</td>
