@@ -2860,6 +2860,42 @@ def painel_gravar_ordem():
     return jsonify(_painel_ordem_view(p, o, _painel_ve_valores(perfil)))
 
 
+@app.route('/api/painel/<oid>/iniciar-execucao', methods=['POST'])
+def painel_iniciar_execucao(oid):
+    """O técnico começa a manutenção: o cartão sai de 'Fila de Manutenção' e vai para 'Em Execução' (data de execução = hoje)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    p = _painel_estado(full_data)
+    perfil = _painel_perfil(full_data, user)
+    o = p['ordens'].get(oid)
+    vis = _painel_colunas_visiveis(p, perfil)
+    if not o or (vis is not None and o.get('col') not in vis):
+        return jsonify({"error": "OS não encontrada"}), 404
+    if perfil not in ('admin', 'manutencao'):
+        return _sem_permissao()
+    if o.get('col') != 'fila':
+        return jsonify({"error": "Só dá para iniciar a execução de uma manutenção que está na Fila de Manutenção."}), 400
+    if not o.get('dExecucao'):
+        o['dExecucao'] = datetime.now().strftime('%Y-%m-%d')
+    if not o.get('tecnico'):
+        o['tecnico'] = _responsavel_nome(full_data, user)
+    o['col'] = 'exec'
+    o['atualizadoEm'] = datetime.utcnow().isoformat() + "Z"
+    o['atualizadoPor'] = user
+    # a OS do Smart (se já foi trazida do Omie) também entra em execução
+    num = str(o.get('os') or '').strip()
+    agora = datetime.utcnow().isoformat() + "Z"
+    for _owner, d in _all_filial_drafts(full_data, user):
+        if num and str(d.get('omieOsNumber') or '').strip() == num:
+            d['execEstado'] = 'a_executar'
+            d['execIniciadaAt'] = agora
+            d['execIniciadaPor'] = user
+    _painel_bump(p)
+    save_data(full_data)
+    return jsonify({"success": True, "col": "exec"})
+
+
 @app.route('/api/painel/ordem/<oid>', methods=['DELETE'])
 def painel_excluir_ordem(oid):
     user, full_data, err = _require_user()
@@ -9315,7 +9351,169 @@ HTML_PAGE = """
                 } catch (e) { alert('Erro de rede: ' + (e.message || e)); }
             };
 
+            // "Puxar para execução": pergunta se o técnico vai executar o serviço. Sim -> a OS passa para "Em Execução"
+            // no Smart (traz a OS do Omie se ainda não estiver aqui) e no painel.
+            const iniciarExecucaoBancada = async (e) => {
+                if (!e.osNum) { alert('Este cartão do painel ainda não tem o nº da OS. Peça ao vendedor para preenchê-lo.'); return; }
+                if (!confirm('Você vai executar este serviço?\\n\\nSe sim, a OS ' + e.osNum + ' passa para "Em Execução" no Smart e no painel.')) return;
+                setPuxandoOs(e.osNum);
+                try {
+                    if (!e.osId) {   // ainda não está no Smart: traz a OS do Omie pelo número
+                        const r1 = await fetch('/api/os/abrir-por-numero', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth.token }, body: JSON.stringify({ numero: e.osNum }) }).then(r => r.json());
+                        if (r1.error) { alert('Erro ao abrir a OS: ' + r1.error); return; }
+                    }
+                    const d = await fetch(`/api/painel/${e.painelId}/iniciar-execucao`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth.token } }).then(r => r.json());
+                    if (!d.success) { alert('Erro: ' + (d.error || 'falha ao iniciar a execução')); return; }
+                    fetchBancada();
+                    fetchOsDrafts();
+                } catch (err) { alert('Erro de rede: ' + (err.message || err)); }
+                finally { setPuxandoOs(null); }
+            };
+
             const renderServicosExecutar = () => {
+                const aprovadas = bancadaOps.filter(e => e.painelCol !== 'exec');   // Fila de Manutenção (aprovadas)
+                const emExecucao = bancadaOps.filter(e => e.painelCol === 'exec');   // Em Execução
+                const cardBancada = (e) => {
+                    const o = e.os;
+                    if (!o) {
+                        return html`
+                            <div key=${e.painelId} className="bg-white rounded-xl shadow-sm border border-dashed border-amber-300 p-4">
+                                <div className="font-semibold text-slate-800">${e.cliente || 'Sem cliente'}</div>
+                                <div className="text-xs text-slate-500">${e.osNum ? html`OS <span className="font-mono">${e.osNum}</span> · ` : ''}${e.equipamento || 'Equipamento'}${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}</div>
+                                ${e.osNum ? html`
+                                    <button onClick=${() => abrirOsDoPainel(e.osNum)} disabled=${puxandoOs === e.osNum} className="mt-2 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-60">
+                                        ${puxandoOs === e.osNum ? 'Abrindo…' : 'Abrir OS ' + e.osNum + ' do Omie'}
+                                    </button>` : html`<p className="text-xs text-amber-600 mt-2"><i className="ph-bold ph-warning"></i> Este cartão do painel ainda não tem o nº da OS — peça ao vendedor para preenchê-lo.</p>`}
+                            </div>`;
+                    }
+                    const prog = execProgresso(o);
+                    const aberta = execAbertaId === o.id;
+                    const os = aberta && execOs ? execOs : o;
+                    const completo = prog.total > 0 && prog.feitos === prog.total;
+                    const reprovado = o.execEstado === 'reprovado';
+                    return html`
+                        <div key=${o.id} className="bg-white rounded-xl shadow-sm border ${reprovado ? 'border-red-300' : (completo ? 'border-emerald-300' : 'border-slate-200')} overflow-hidden">
+                            <button onClick=${() => abrirExec(o)} className="w-full p-4 flex items-center justify-between gap-3 hover:bg-slate-50 text-left">
+                                <div className="min-w-0">
+                                    <div className="font-semibold text-slate-800 truncate">${e.cliente || (o.client && o.client.name) || 'Sem cliente'}</div>
+                                    <div className="text-xs text-slate-500 truncate">
+                                        ${e.equipamento || (o.fromLaudo && o.fromLaudo.model) || 'Equipamento'}
+                                        ${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}
+                                        ${o.omieOsNumber ? html` · OS ${o.omieOsNumber}` : ''}
+                                    </div>
+                                    ${reprovado && o.execMotivoReprova ? html`
+                                        <div className="text-xs text-red-600 mt-1 flex items-start gap-1">
+                                            <i className="ph-fill ph-warning-circle flex-shrink-0 mt-0.5"></i>
+                                            <span className="line-clamp-2">${o.execMotivoReprova}</span>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                                <div className="flex items-center gap-3 flex-shrink-0">
+                                    ${reprovado ? html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-red-100 text-red-700 whitespace-nowrap">Reprovado no teste</span>` : ''}
+                                    <span className=${`text-xs font-bold px-2 py-1 rounded-full ${completo ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>
+                                        ${prog.feitos}/${prog.total}
+                                    </span>
+                                    <i className=${`ph-bold ${aberta ? 'ph-caret-up' : 'ph-caret-down'} text-slate-400`}></i>
+                                </div>
+                            </button>
+
+                            ${aberta && html`
+                                <div className="border-t border-slate-200 p-4 space-y-5">
+                                    ${execCarregando && html`<div className="text-xs text-slate-400 flex items-center gap-1"><i className="ph ph-spinner animate-spin"></i> carregando fotos…</div>`}
+
+                                    ${(e.resumo || (os.services || []).length || (os.parts || []).length) ? html`
+                                        <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
+                                            <div className="text-xs font-bold text-amber-800 uppercase mb-2 flex items-center gap-1"><i className="ph-fill ph-clipboard-text"></i> Resumo do que fazer</div>
+                                            ${(os.services || []).length ? html`
+                                                <div className="text-sm text-slate-800 mb-1">
+                                                    <b>Serviços:</b> ${(os.services || []).map(s => `${s.description || s.code || 'serviço'}${s.quantity > 1 ? ` (${s.quantity}x)` : ''}`).join(' · ')}
+                                                </div>` : ''}
+                                            ${(os.parts || []).length ? html`
+                                                <div className="text-sm text-slate-800 mb-1">
+                                                    <b>Peças:</b> ${(os.parts || []).map(p => `${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}`).join(' · ')}
+                                                </div>` : ''}
+                                            ${e.resumo ? html`
+                                                <div className="mt-2 pt-2 border-t border-amber-200">
+                                                    <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
+                                                        ${resumoAberto[o.id] || e.resumo.length <= 260 ? e.resumo : e.resumo.slice(0, 260).trim() + '…'}
+                                                    </p>
+                                                    ${e.resumo.length > 260 ? html`
+                                                        <button onClick=${() => setResumoAberto(p => ({ ...p, [o.id]: !p[o.id] }))} className="text-xs font-bold text-amber-800 hover:underline mt-1">
+                                                            ${resumoAberto[o.id] ? 'ver menos' : 'ver laudo completo'}
+                                                        </button>` : ''}
+                                                </div>` : ''}
+                                        </div>
+                                    ` : ''}
+
+                                    ${os.execEstado === 'reprovado' && os.execMotivoReprova ? html`
+                                        <div className="bg-red-50 border border-red-300 rounded-lg p-3">
+                                            <div className="text-xs font-bold text-red-700 uppercase mb-1"><i className="ph-fill ph-warning-circle"></i> Reprovado no teste — corrigir</div>
+                                            <p className="text-sm text-red-800 whitespace-pre-wrap">${os.execMotivoReprova}</p>
+                                        </div>
+                                    ` : ''}
+
+                                    <div>
+                                        <h3 className="text-sm font-bold text-slate-700 mb-2 flex items-center gap-1"><i className="ph-fill ph-wrench text-blue-600"></i> Serviços</h3>
+                                        ${!(os.services || []).length ? html`<p className="text-xs text-slate-400">Nenhum serviço nesta OS.</p>` : html`
+                                            <div className="space-y-1">
+                                                ${(os.services || []).map((s, i) => {
+                                                    const feito = !!(os.checklistServicos || [])[i];
+                                                    return html`
+                                                        <label key=${i} className="flex items-start gap-2 p-2 rounded-lg bg-white border border-slate-200 cursor-pointer hover:border-blue-300">
+                                                            <input type="checkbox" checked=${feito} onChange=${() => execToggle('servico', i)} className="mt-0.5 h-4 w-4 accent-emerald-600 flex-shrink-0" />
+                                                            <span className=${`text-sm ${feito ? 'line-through text-slate-400' : 'text-slate-700'}`}>
+                                                                ${s.description || s.code || 'serviço'}${s.quantity > 1 ? ` (${s.quantity}x)` : ''}
+                                                            </span>
+                                                        </label>`;
+                                                })}
+                                            </div>
+                                        `}
+                                    </div>
+
+                                    <div>
+                                        <h3 className="text-sm font-bold text-slate-700 mb-2 flex items-center gap-1"><i className="ph-fill ph-package text-amber-600"></i> Peças</h3>
+                                        ${!(os.parts || []).length ? html`<p className="text-xs text-slate-400">Nenhuma peça nesta OS.</p>` : html`
+                                            <div className="space-y-2">
+                                                ${(os.parts || []).map((p, i) => {
+                                                    const feito = !!(os.checklistPecas || [])[i];
+                                                    return html`
+                                                        <div key=${i} className="p-3 rounded-lg bg-white border border-slate-200">
+                                                            <label className="flex items-start gap-2 cursor-pointer">
+                                                                <input type="checkbox" checked=${feito} onChange=${() => execToggle('peca', i)} className="mt-0.5 h-4 w-4 accent-emerald-600 flex-shrink-0" />
+                                                                <span className=${`text-sm ${feito ? 'line-through text-slate-400' : 'text-slate-700'}`}>
+                                                                    ${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}
+                                                                </span>
+                                                            </label>
+                                                            ${controlesSubstituicao(p, i, execPatchPeca, execFotoPeca)}
+                                                        </div>`;
+                                                })}
+                                            </div>
+                                        `}
+                                    </div>
+
+                                    ${(os.parts || []).length ? html`
+                                        <div className="flex justify-end pt-1">
+                                            <button onClick=${execSalvarPecas} disabled=${execPecasSalvando} className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2">
+                                                <i className="ph-bold ph-floppy-disk"></i> ${execPecasSalvando ? 'Salvando…' : 'Salvar registro das peças'}
+                                            </button>
+                                        </div>
+                                        <p className="text-xs text-slate-400 text-right -mt-3">As caixinhas salvam sozinhas. O nº de série e as fotos precisam deste botão.</p>
+                                    ` : ''}
+
+                                    <div className="border-t border-slate-200 pt-4 flex items-center justify-between gap-3 flex-wrap">
+                                        <p className="text-xs text-slate-500">
+                                            ${prog.total && prog.feitos < prog.total
+                                                ? html`<i className="ph-bold ph-info text-amber-500"></i> Faltam ${prog.total - prog.feitos} item(ns) — dá pra finalizar assim mesmo.`
+                                                : html`<i className="ph-bold ph-check-circle text-emerald-500"></i> Tudo marcado.`}
+                                        </p>
+                                        <button onClick=${() => execFinalizarServico(os)} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2 shadow-md">
+                                            <i className="ph-bold ph-flag-checkered"></i> Finalizar serviço
+                                        </button>
+                                    </div>
+                                </div>
+                            `}
+                        </div>`;
+                };
                 return html`
                     <div className="space-y-4">
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
@@ -9325,7 +9523,7 @@ HTML_PAGE = """
                                         <i className="ph-fill ph-wrench text-orange-500 text-2xl"></i> Serviços a executar
                                         <span className="text-sm font-normal text-slate-400">(${bancadaOps.length} no painel)</span>
                                     </h2>
-                                    <p className="text-sm text-slate-500 mt-1">Equipamentos em "Fila de Manutenção" e "Em Execução" no Painel de Manutenção. Marque cada serviço/peça conforme executar.</p>
+                                    <p className="text-sm text-slate-500 mt-1">Duas listas do Painel de Manutenção: as manutenções aprovadas (Fila de Manutenção) e as que estão Em Execução. Marque cada serviço/peça conforme executar.</p>
                                 </div>
                                 <button onClick=${fetchBancada} disabled=${bancadaLoading} className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-1 disabled:opacity-50">
                                     <i className=${`ph-bold ph-arrows-clockwise ${bancadaLoading ? 'animate-spin' : ''}`}></i> ${bancadaLoading ? 'Atualizando…' : 'Atualizar'}
@@ -9343,147 +9541,28 @@ HTML_PAGE = """
                                 <i className="ph ph-check-circle text-5xl mb-2"></i>
                                 <p>Nenhum equipamento em preparação no momento.</p>
                             </div>
-                        ` : bancadaOps.map(e => {
-                            const o = e.os;
-                            if (!o) {
-                                return html`
-                                    <div key=${e.painelId} className="bg-white rounded-xl shadow-sm border border-dashed border-amber-300 p-4">
-                                        <div className="font-semibold text-slate-800">${e.cliente || 'Sem cliente'}</div>
-                                        <div className="text-xs text-slate-500">${e.osNum ? html`OS <span className="font-mono">${e.osNum}</span> · ` : ''}${e.equipamento || 'Equipamento'}${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}</div>
-                                        ${e.osNum ? html`
-                                            <button onClick=${() => abrirOsDoPainel(e.osNum)} disabled=${puxandoOs === e.osNum} className="mt-2 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-xs font-medium disabled:opacity-60">
-                                                ${puxandoOs === e.osNum ? 'Abrindo…' : 'Abrir OS ' + e.osNum + ' do Omie'}
-                                            </button>` : html`<p className="text-xs text-amber-600 mt-2"><i className="ph-bold ph-warning"></i> Este cartão do painel ainda não tem o nº da OS — peça ao vendedor para preenchê-lo.</p>`}
-                                    </div>`;
-                            }
-                            const prog = execProgresso(o);
-                            const aberta = execAbertaId === o.id;
-                            const os = aberta && execOs ? execOs : o;
-                            const completo = prog.total > 0 && prog.feitos === prog.total;
-                            const reprovado = o.execEstado === 'reprovado';
-                            return html`
-                                <div key=${o.id} className="bg-white rounded-xl shadow-sm border ${reprovado ? 'border-red-300' : (completo ? 'border-emerald-300' : 'border-slate-200')} overflow-hidden">
-                                    <button onClick=${() => abrirExec(o)} className="w-full p-4 flex items-center justify-between gap-3 hover:bg-slate-50 text-left">
-                                        <div className="min-w-0">
-                                            <div className="font-semibold text-slate-800 truncate">${e.cliente || (o.client && o.client.name) || 'Sem cliente'}</div>
-                                            <div className="text-xs text-slate-500 truncate">
-                                                ${e.equipamento || (o.fromLaudo && o.fromLaudo.model) || 'Equipamento'}
-                                                ${e.serie ? html` · <span className="font-mono">${e.serie}</span>` : ''}
-                                                ${o.omieOsNumber ? html` · OS ${o.omieOsNumber}` : ''}
-                                            </div>
-                                            ${reprovado && o.execMotivoReprova ? html`
-                                                <div className="text-xs text-red-600 mt-1 flex items-start gap-1">
-                                                    <i className="ph-fill ph-warning-circle flex-shrink-0 mt-0.5"></i>
-                                                    <span className="line-clamp-2">${o.execMotivoReprova}</span>
-                                                </div>
-                                            ` : ''}
+                        ` : html`
+                            <div className="space-y-3">
+                                <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wide flex items-center gap-2">
+                                    <i className="ph-fill ph-list-checks text-blue-500"></i> Lista de Manutenção Aprovadas
+                                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">${aprovadas.length}</span>
+                                </h3>
+                                ${aprovadas.length ? aprovadas.map(e => html`
+                                    <div key=${'ap_' + e.painelId}>
+                                        ${cardBancada(e)}
+                                        <div className="flex justify-end mt-1">
+                                            <button onClick=${() => iniciarExecucaoBancada(e)} disabled=${puxandoOs === e.osNum} className="bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1"><i className="ph-bold ph-play"></i> Puxar para execução</button>
                                         </div>
-                                        <div className="flex items-center gap-3 flex-shrink-0">
-                                            ${reprovado ? html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-red-100 text-red-700 whitespace-nowrap">Reprovado no teste</span>` : ''}
-                                            <span className=${`text-xs font-bold px-2 py-1 rounded-full ${completo ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>
-                                                ${prog.feitos}/${prog.total}
-                                            </span>
-                                            <i className=${`ph-bold ${aberta ? 'ph-caret-up' : 'ph-caret-down'} text-slate-400`}></i>
-                                        </div>
-                                    </button>
-
-                                    ${aberta && html`
-                                        <div className="border-t border-slate-200 p-4 space-y-5">
-                                            ${execCarregando && html`<div className="text-xs text-slate-400 flex items-center gap-1"><i className="ph ph-spinner animate-spin"></i> carregando fotos…</div>`}
-
-                                            ${(e.resumo || (os.services || []).length || (os.parts || []).length) ? html`
-                                                <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
-                                                    <div className="text-xs font-bold text-amber-800 uppercase mb-2 flex items-center gap-1"><i className="ph-fill ph-clipboard-text"></i> Resumo do que fazer</div>
-                                                    ${(os.services || []).length ? html`
-                                                        <div className="text-sm text-slate-800 mb-1">
-                                                            <b>Serviços:</b> ${(os.services || []).map(s => `${s.description || s.code || 'serviço'}${s.quantity > 1 ? ` (${s.quantity}x)` : ''}`).join(' · ')}
-                                                        </div>` : ''}
-                                                    ${(os.parts || []).length ? html`
-                                                        <div className="text-sm text-slate-800 mb-1">
-                                                            <b>Peças:</b> ${(os.parts || []).map(p => `${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}`).join(' · ')}
-                                                        </div>` : ''}
-                                                    ${e.resumo ? html`
-                                                        <div className="mt-2 pt-2 border-t border-amber-200">
-                                                            <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
-                                                                ${resumoAberto[o.id] || e.resumo.length <= 260 ? e.resumo : e.resumo.slice(0, 260).trim() + '…'}
-                                                            </p>
-                                                            ${e.resumo.length > 260 ? html`
-                                                                <button onClick=${() => setResumoAberto(p => ({ ...p, [o.id]: !p[o.id] }))} className="text-xs font-bold text-amber-800 hover:underline mt-1">
-                                                                    ${resumoAberto[o.id] ? 'ver menos' : 'ver laudo completo'}
-                                                                </button>` : ''}
-                                                        </div>` : ''}
-                                                </div>
-                                            ` : ''}
-
-                                            ${os.execEstado === 'reprovado' && os.execMotivoReprova ? html`
-                                                <div className="bg-red-50 border border-red-300 rounded-lg p-3">
-                                                    <div className="text-xs font-bold text-red-700 uppercase mb-1"><i className="ph-fill ph-warning-circle"></i> Reprovado no teste — corrigir</div>
-                                                    <p className="text-sm text-red-800 whitespace-pre-wrap">${os.execMotivoReprova}</p>
-                                                </div>
-                                            ` : ''}
-
-                                            <div>
-                                                <h3 className="text-sm font-bold text-slate-700 mb-2 flex items-center gap-1"><i className="ph-fill ph-wrench text-blue-600"></i> Serviços</h3>
-                                                ${!(os.services || []).length ? html`<p className="text-xs text-slate-400">Nenhum serviço nesta OS.</p>` : html`
-                                                    <div className="space-y-1">
-                                                        ${(os.services || []).map((s, i) => {
-                                                            const feito = !!(os.checklistServicos || [])[i];
-                                                            return html`
-                                                                <label key=${i} className="flex items-start gap-2 p-2 rounded-lg bg-white border border-slate-200 cursor-pointer hover:border-blue-300">
-                                                                    <input type="checkbox" checked=${feito} onChange=${() => execToggle('servico', i)} className="mt-0.5 h-4 w-4 accent-emerald-600 flex-shrink-0" />
-                                                                    <span className=${`text-sm ${feito ? 'line-through text-slate-400' : 'text-slate-700'}`}>
-                                                                        ${s.description || s.code || 'serviço'}${s.quantity > 1 ? ` (${s.quantity}x)` : ''}
-                                                                    </span>
-                                                                </label>`;
-                                                        })}
-                                                    </div>
-                                                `}
-                                            </div>
-
-                                            <div>
-                                                <h3 className="text-sm font-bold text-slate-700 mb-2 flex items-center gap-1"><i className="ph-fill ph-package text-amber-600"></i> Peças</h3>
-                                                ${!(os.parts || []).length ? html`<p className="text-xs text-slate-400">Nenhuma peça nesta OS.</p>` : html`
-                                                    <div className="space-y-2">
-                                                        ${(os.parts || []).map((p, i) => {
-                                                            const feito = !!(os.checklistPecas || [])[i];
-                                                            return html`
-                                                                <div key=${i} className="p-3 rounded-lg bg-white border border-slate-200">
-                                                                    <label className="flex items-start gap-2 cursor-pointer">
-                                                                        <input type="checkbox" checked=${feito} onChange=${() => execToggle('peca', i)} className="mt-0.5 h-4 w-4 accent-emerald-600 flex-shrink-0" />
-                                                                        <span className=${`text-sm ${feito ? 'line-through text-slate-400' : 'text-slate-700'}`}>
-                                                                            ${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}
-                                                                        </span>
-                                                                    </label>
-                                                                    ${controlesSubstituicao(p, i, execPatchPeca, execFotoPeca)}
-                                                                </div>`;
-                                                        })}
-                                                    </div>
-                                                `}
-                                            </div>
-
-                                            ${(os.parts || []).length ? html`
-                                                <div className="flex justify-end pt-1">
-                                                    <button onClick=${execSalvarPecas} disabled=${execPecasSalvando} className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2">
-                                                        <i className="ph-bold ph-floppy-disk"></i> ${execPecasSalvando ? 'Salvando…' : 'Salvar registro das peças'}
-                                                    </button>
-                                                </div>
-                                                <p className="text-xs text-slate-400 text-right -mt-3">As caixinhas salvam sozinhas. O nº de série e as fotos precisam deste botão.</p>
-                                            ` : ''}
-
-                                            <div className="border-t border-slate-200 pt-4 flex items-center justify-between gap-3 flex-wrap">
-                                                <p className="text-xs text-slate-500">
-                                                    ${prog.total && prog.feitos < prog.total
-                                                        ? html`<i className="ph-bold ph-info text-amber-500"></i> Faltam ${prog.total - prog.feitos} item(ns) — dá pra finalizar assim mesmo.`
-                                                        : html`<i className="ph-bold ph-check-circle text-emerald-500"></i> Tudo marcado.`}
-                                                </p>
-                                                <button onClick=${() => execFinalizarServico(os)} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg font-bold text-sm flex items-center gap-2 shadow-md">
-                                                    <i className="ph-bold ph-flag-checkered"></i> Finalizar serviço
-                                                </button>
-                                            </div>
-                                        </div>
-                                    `}
-                                </div>`;
-                        })}
+                                    </div>`) : html`<div className="bg-white p-6 rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-400">Nenhuma manutenção aprovada aguardando.</div>`}
+                            </div>
+                            <div className="space-y-3">
+                                <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wide flex items-center gap-2">
+                                    <i className="ph-fill ph-wrench text-orange-500"></i> Em Execução
+                                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">${emExecucao.length}</span>
+                                </h3>
+                                ${emExecucao.length ? emExecucao.map(e => html`<div key=${'ex_' + e.painelId}>${cardBancada(e)}</div>`) : html`<div className="bg-white p-6 rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-400">Nenhuma manutenção em execução.</div>`}
+                            </div>
+                        `}
                     </div>`;
             };
 
