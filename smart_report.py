@@ -5622,6 +5622,9 @@ HTML_PAGE = """
 
             useEffect(() => {
                 if (!auth) return;
+                // Vendedor e Expedição só usam o Painel (o servidor bloqueia as demais APIs): nem tentam carregar os dados do
+                // Smart — antes o erro desse carregamento derrubava a sessão e o painel voltava para o login.
+                if (auth.role === 'vendedor' || auth.role === 'expedicao') return;
 
                 fetch('/api/data', { headers: { 'Authorization': auth.token } })
                     .then(res => {
@@ -5673,7 +5676,8 @@ HTML_PAGE = """
                             })
                             .catch(() => {});
                     })
-                    .catch(() => handleLogout());
+                    // Só a sessão inválida (401) desloga. Falha de rede/permissão NÃO pode encerrar a sessão no servidor.
+                    .catch(err => { if (err && err.message === 'Unauthorized') handleLogout(); else console.warn('Falha ao carregar os dados:', err); });
             }, [auth]);
 
             useEffect(() => {
