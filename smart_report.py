@@ -5130,9 +5130,9 @@ def os_painel_finalizar(os_id):
     if not cartao:
         aviso = f"OS {num or '—'} não encontrada no painel: preencha o nº da OS no cartão do painel."
     elif destino:
-        antes = cartao.get('col')
         _painel_mover_por_os(full_data, num, destino, user)
-        movido = cartao.get('col') != antes
+        # "movido" = o cartão está no destino agora (aprovar em /execucao já o move antes deste passo)
+        movido = cartao.get('col') == destino
     draft['painelFinalizadoAt'] = datetime.utcnow().isoformat() + "Z"
     save_data(full_data)
     nome_col = next((c['name'] for c in _painel_estado(full_data)['cols'] if cartao and c['id'] == cartao.get('col')), '')
