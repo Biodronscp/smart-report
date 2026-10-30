@@ -5702,6 +5702,7 @@ HTML_PAGE = """
             const [bancadaBusca, setBancadaBusca] = useState('');   // pesquisa em Serviços a executar
             const [histBusca, setHistBusca] = useState('');         // pesquisa no Histórico
             const [osBusca, setOsBusca] = useState('');             // pesquisa em Ordens de Serviço
+            const [abertasAberto, setAbertasAberto] = useState(false);   // seção "OS abertas no Omie" (recolhida)
             // Aba "Teste e Liberação" (execEstado === 'aguardando_teste')
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
@@ -5944,7 +5945,7 @@ HTML_PAGE = """
                     headers: { 'Authorization': auth.token }
                 }).then(r => r.json()).then(() => {
                     alert('Cache limpo! Próxima busca vai puxar dados frescos do Omie.');
-                    if (activeTab === 'os') fetchOmieAbertas();
+                    if (activeTab === 'os' && abertasAberto) fetchOmieAbertas();
                 });
             };
 
@@ -5968,7 +5969,6 @@ HTML_PAGE = """
                 }
                 if (auth && activeTab === 'os') {
                     if (!omieStatus.checked) checkOmieStatus();
-                    if (!currentOs) fetchOmieAbertas();
                 }
             }, [activeTab, auth, currentOs]);
 
@@ -10202,153 +10202,181 @@ HTML_PAGE = """
                 }
 
                 // Tela de LISTA de OSes
+                const COL_PAINEL = {
+                    chegada: ['Chegada de Equipamento', 'bg-slate-100 text-slate-600'], analise: ['Aguardando Análise', 'bg-slate-100 text-slate-600'],
+                    aprov: ['Aguardando Aprovação', 'bg-amber-100 text-amber-700'], fila: ['Fila de Manutenção', 'bg-blue-100 text-blue-700'],
+                    exec: ['Em Execução', 'bg-orange-100 text-orange-700'], teste: ['Teste de Equipamento', 'bg-purple-100 text-purple-700'],
+                    final: ['Finalizado', 'bg-emerald-100 text-emerald-700'], condenado: ['Condenado', 'bg-slate-800 text-white'],
+                    pronto: ['Pronto para Envio', 'bg-emerald-100 text-emerald-700'], enviado: ['Enviado', 'bg-emerald-100 text-emerald-700']
+                };
+                const verTotal = auth.role === 'admin';   // valores só para o administrador (igual à tela da OS)
+                const termoOs = osBusca.trim();
+                const achadas = osDrafts.filter(o => casaBusca(osBusca, o.omieOsNumber, o.omieOsId, o.client && o.client.name));
+                const lista = achadas.filter(o => osFilter === 'todas' || (osFilter === 'enviadas' && o.status === 'sent') || (osFilter === 'pendentes' && o.status !== 'sent'));
+                const trazerOsPorNumero = async (num) => {
+                    setPuxandoOs(num);
+                    try {
+                        const d = await fetch('/api/os/abrir-por-numero', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                            body: JSON.stringify({ numero: num })
+                        }).then(r => r.json());
+                        if (d.error) { alert('Erro: ' + d.error); return; }
+                        fetchOsDrafts();
+                        abrirOsCompleta(d);
+                    } catch (e) { alert('Erro de rede: ' + (e.message || e)); }
+                    finally { setPuxandoOs(null); }
+                };
                 return html`
-                    <div className="space-y-6 animate-in fade-in duration-300">
-                        <div className=${`p-4 rounded-xl border flex items-center gap-3 ${omieStatus.ok ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
-                            <i className=${`ph-fill ${omieStatus.ok ? 'ph-check-circle text-green-600' : 'ph-warning text-amber-600'} text-2xl`}></i>
-                            <div className="flex-1">
-                                <div className="font-bold ${omieStatus.ok ? 'text-green-800' : 'text-amber-800'}">${omieStatus.ok ? 'Conectado ao Omie' : (omieStatus.configured ? 'Erro de conexão Omie' : 'Omie não configurado')}</div>
-                                ${!omieStatus.ok && html`<div className="text-sm text-amber-700">${omieStatus.message || 'Cadastre OMIE_APP_KEY e OMIE_APP_SECRET nas variáveis de ambiente do servidor.'}</div>`}
-                                ${omieStatus.ok && html`<div className="text-xs text-green-700">Cache em disco persistente (24h). Use "Limpar cache" se cadastrar serviços/peças/clientes novos no Omie.</div>`}
-                            </div>
-                            <button onClick=${checkOmieStatus} className="text-sm bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50" title="Testar conexão"><i className="ph-bold ph-arrows-clockwise"></i> Testar</button>
-                            <button onClick=${clearOmieCache} className="text-sm bg-white border border-slate-300 px-3 py-1.5 rounded hover:bg-slate-50" title="Limpa cache local de catálogos do Omie"><i className="ph-bold ph-broom"></i> Limpar cache</button>
-                        </div>
-
+                    <div className="space-y-4 animate-in fade-in duration-300">
                         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                            <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2 mb-1"><i className="ph-fill ph-magnifying-glass text-purple-600 text-2xl"></i> Rastrear peça por nº de série</h2>
-                            <p className="text-sm text-slate-500 mb-3">Numa reclamação de garantia, busque o número de série pra ver em qual OS/manutenção a peça foi instalada (nova) ou retirada (velha).</p>
-                            <div className="flex gap-2">
-                                <input type="text" value=${serialBusca} onChange=${e => setSerialBusca(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') buscarSerial(); }} placeholder="Nº de série (mín. 3 caracteres)" className="flex-1 p-2 border border-slate-300 rounded-lg font-mono outline-none focus:ring-2 focus:ring-purple-400" />
-                                <button onClick=${buscarSerial} className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg font-medium"><i className="ph-bold ph-magnifying-glass"></i> Buscar</button>
-                            </div>
-                            ${serialResultados === 'loading' && html`<div className="text-sm text-slate-500 mt-3"><i className="ph ph-spinner animate-spin"></i> Buscando...</div>`}
-                            ${Array.isArray(serialResultados) && (serialResultados.length === 0 ? html`<div className="text-sm text-slate-400 mt-3">Nenhuma peça encontrada com esse número de série.</div>` : html`
-                                <div className="mt-3 overflow-x-auto rounded border border-slate-200">
-                                    <table className="min-w-full text-sm">
-                                        <thead className="bg-slate-100 text-slate-700"><tr><th className="p-2 text-left">Situação</th><th className="p-2 text-left">Nº Série</th><th className="p-2 text-left">Peça</th><th className="p-2 text-left">OS</th><th className="p-2 text-left">Oportun.</th><th className="p-2 text-left">Cliente</th><th className="p-2 text-left">Data</th></tr></thead>
-                                        <tbody className="divide-y divide-slate-100">
-                                            ${serialResultados.map((r, idx) => html`<tr key=${idx} className="hover:bg-slate-50">
-                                                <td className="p-2"><span className=${r.papel === 'instalada' ? 'bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap' : 'bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap'}>${r.papel === 'instalada' ? 'Instalada (nova)' : 'Retirada (velha)'}</span></td>
-                                                <td className="p-2 font-mono text-xs">${r.serial}</td>
-                                                <td className="p-2 text-xs">${r.peca}</td>
-                                                <td className="p-2 text-xs font-mono">${r.osNumero}</td>
-                                                <td className="p-2 text-xs font-mono">${r.crmOpNum || '—'}</td>
-                                                <td className="p-2 text-xs">${r.cliente}</td>
-                                                <td className="p-2 text-xs">${(r.data || '').slice(0, 10)}</td>
-                                            </tr>`)}
-                                        </tbody>
-                                    </table>
+                            <div className="flex justify-between items-center mb-1 flex-wrap gap-2">
+                                <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-clipboard-text text-indigo-600 text-2xl"></i> Ordens de Serviço
+                                    <span className="text-sm font-normal text-slate-400">(${osDrafts.length})</span></h2>
+                                <div className="flex items-center gap-3 flex-wrap">
+                                    <span className=${`text-xs flex items-center gap-1 ${omieStatus.ok ? 'text-emerald-700' : 'text-amber-700'}`} title=${omieStatus.ok ? 'Conexão com o Omie funcionando' : (omieStatus.message || 'Omie não conectado')}>
+                                        <i className=${`ph-fill ${omieStatus.ok ? 'ph-check-circle' : 'ph-warning'}`}></i> ${omieStatus.ok ? 'Omie conectado' : (omieStatus.configured ? 'Erro de conexão com o Omie' : 'Omie não configurado')}
+                                        <button onClick=${checkOmieStatus} className="underline text-slate-500 hover:text-slate-700 ml-1">testar</button>
+                                    </span>
+                                    <button onClick=${() => createNewOs()} title="Cria uma OS em branco, sem vínculo com o Omie. O normal é a OS chegar do painel." className="bg-white hover:bg-indigo-50 text-indigo-700 border border-indigo-300 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1"><i className="ph-bold ph-plus"></i> Nova OS manual</button>
                                 </div>
-                            `)}
-                        </div>
-
-                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                            <div className="flex justify-between items-center mb-4">
-                                <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-cloud-arrow-down text-amber-600 text-2xl"></i> OSes Abertas no Omie (${omieAbertas.length})</h2>
-                                <button onClick=${fetchOmieAbertas} disabled=${loadingAbertas} className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded text-sm font-medium flex items-center gap-1 disabled:opacity-50">
-                                    <i className=${`ph-bold ph-arrows-clockwise ${loadingAbertas ? 'animate-spin' : ''}`}></i> ${loadingAbertas ? 'Carregando...' : 'Atualizar'}
-                                </button>
                             </div>
-                            <p className="text-xs text-slate-500 mb-3">OSes criadas no Omie (vendedor) e ainda não faturadas. Clique pra abrir no app, completar dados técnicos e salvar de volta.</p>
-                            ${omieAbertas.length === 0 && !loadingAbertas ? html`
-                                <div className="text-center py-6 text-sm text-slate-400">Nenhuma OS aberta (não faturada e não cancelada) encontrada nas páginas recentes do Omie.</div>
-                            ` : html`
-                                <div className="overflow-x-auto rounded border border-slate-200">
-                                    <table className="min-w-full text-sm">
-                                        <thead className="bg-amber-50 text-slate-700">
-                                            <tr>
-                                                <th className="p-2 text-left">Nº OS</th>
-                                                <th className="p-2 text-left">Cliente</th>
-                                                <th className="p-2 text-left">Etapa</th>
-                                                <th className="p-2 text-left">Inclusão</th>
-                                                <th className="p-2 text-right">Total</th>
-                                                <th className="p-2 text-right">Ação</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody className="divide-y divide-slate-100">
-                                            ${omieAbertas.map(o => {
-                                                const ja = osDrafts.find(d => d.omieOsId === o.nCodOS);
-                                                return html`
-                                                <tr key=${o.nCodOS} className="hover:bg-slate-50">
-                                                    <td className="p-2 font-mono text-xs">${o.cNumOS || '—'}</td>
-                                                    <td className="p-2 text-xs">
-                                                        <div className="font-medium text-slate-800">${o.clientName || '—'}</div>
-                                                        ${o.cContato && html`<div className="text-slate-500">contato: ${o.cContato}</div>`}
-                                                    </td>
-                                                    <td className="p-2"><span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded text-xs font-bold">${o.cEtapa || '—'}</span></td>
-                                                    <td className="p-2 text-xs">${o.dDtInc || ''}</td>
-                                                    <td className="p-2 text-xs text-right">R$ ${parseFloat(o.nValorTotal || 0).toFixed(2)}</td>
-                                                    <td className="p-2 text-right">
-                                                        ${ja ? html`
-                                                            <button onClick=${() => abrirOsCompleta(ja)} className="bg-blue-50 hover:bg-blue-100 text-blue-700 px-3 py-1 rounded text-xs font-medium">Abrir</button>
-                                                        ` : html`
-                                                            <button onClick=${() => importarOsDoOmie(o.nCodOS)} className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1 rounded text-xs font-medium"><i className="ph-bold ph-download-simple"></i> Importar</button>
-                                                        `}
-                                                    </td>
-                                                </tr>
-                                            `})}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            `}
-                        </div>
+                            <p className="text-xs text-slate-500 mb-3">As OS chegam do Painel de Manutenção. Aqui você acompanha cada uma, abre o laudo/peças e vê em que etapa do painel ela está.</p>
 
-                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                            <div className="flex justify-between items-center mb-4 flex-wrap gap-2">
-                                <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-clipboard-text text-indigo-600 text-2xl"></i> Ordens de Serviço da Filial</h2>
-                                <button onClick=${() => createNewOs()} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded font-medium flex items-center gap-1"><i className="ph-bold ph-plus"></i> Nova OS</button>
+                            <div className="flex gap-2 mb-3 text-sm flex-wrap">
+                                ${[['todas','Todas',osDrafts.length],['pendentes','Laudo em preenchimento',osDrafts.filter(o=>o.status!=='sent').length],['enviadas','Laudo enviado',osDrafts.filter(o=>o.status==='sent').length]].map(([key,label,count]) => html`
+                                    <button key=${key} onClick=${() => setOsFilter(key)} className=${`px-3 py-1.5 rounded-full font-medium border ${osFilter===key ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>${label} <span className=${`ml-1 px-1.5 rounded-full text-xs ${osFilter===key?'bg-white/25':'bg-slate-200 text-slate-700'}`}>${count}</span></button>
+                                `)}
                             </div>
-                            ${osDrafts.length === 0 ? html`
-                                <div className="text-center py-10 text-slate-500">
+                            <div className="mb-3">${campoBusca(osBusca, setOsBusca, osDrafts.length, achadas.length)}</div>
+
+                            ${!lista.length ? html`
+                                <div className="text-center py-8 text-slate-500">
                                     <i className="ph ph-clipboard text-5xl"></i>
-                                    <p className="mt-2">Nenhuma OS criada ainda. Clique em "Nova OS" ou gere uma a partir de um laudo.</p>
+                                    <p className="mt-2">${termoOs ? 'Nenhuma OS do Smart combina com "' + termoOs + '".' : (osDrafts.length ? 'Nenhuma OS neste filtro.' : 'Nenhuma OS no Smart ainda. Elas aparecem quando o técnico puxa uma OS do painel (Aguardando Análise ou Serviços a executar).')}</p>
+                                    ${/^[0-9]{1,8}$/.test(termoOs) && html`
+                                        <button onClick=${() => trazerOsPorNumero(termoOs)} disabled=${puxandoOs === termoOs} className="mt-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white px-4 py-2 rounded-lg text-sm font-bold">
+                                            <i className="ph-bold ph-download-simple"></i> ${puxandoOs === termoOs ? 'Trazendo…' : 'Trazer a OS ' + termoOs + ' do Omie'}
+                                        </button>`}
                                 </div>
                             ` : html`
-                                <div className="flex gap-2 mb-3 text-sm">
-                                    ${[['todas','Todas',osDrafts.length],['pendentes','Pendentes',osDrafts.filter(o=>o.status!=='sent').length],['enviadas','Enviadas',osDrafts.filter(o=>o.status==='sent').length]].map(([key,label,count]) => html`
-                                        <button key=${key} onClick=${() => setOsFilter(key)} className=${`px-3 py-1.5 rounded-full font-medium border ${osFilter===key ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>${label} <span className=${`ml-1 px-1.5 rounded-full text-xs ${osFilter===key?'bg-white/25':'bg-slate-200 text-slate-700'}`}>${count}</span></button>
-                                    `)}
-                                </div>
-                                <div className="mb-3">${campoBusca(osBusca, setOsBusca, osDrafts.length, osDrafts.filter(o => casaBusca(osBusca, o.omieOsNumber, o.omieOsId, o.client && o.client.name)).length)}</div>
                                 <div className="overflow-x-auto">
                                     <table className="min-w-full text-sm">
                                         <thead className="bg-slate-100 text-slate-700">
                                             <tr>
-                                                <th className="p-3 text-left">Data</th>
+                                                <th className="p-3 text-left">Nº OS</th>
                                                 <th className="p-3 text-left">Cliente</th>
-                                                <th className="p-3 text-left">Responsável</th>
+                                                <th className="p-3 text-left">Etapa no painel</th>
+                                                <th className="p-3 text-center">Laudo</th>
                                                 <th className="p-3 text-center">Itens</th>
-                                                <th className="p-3 text-right">Total</th>
-                                                <th className="p-3 text-center">Status</th>
+                                                ${verTotal && html`<th className="p-3 text-right">Total</th>`}
                                                 <th className="p-3 text-right">Ações</th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-100">
-                                            ${osDrafts.filter(o => casaBusca(osBusca, o.omieOsNumber, o.omieOsId, o.client && o.client.name)).filter(o => osFilter==='todas' || (osFilter==='enviadas' && o.status==='sent') || (osFilter==='pendentes' && o.status!=='sent')).map(o => html`
+                                            ${lista.map(o => {
+                                                const col = COL_PAINEL[o.painelCol];
+                                                return html`
                                                 <tr key=${o.id} className="hover:bg-slate-50">
-                                                    <td className="p-3 text-xs">${new Date(o.createdAt).toLocaleString('pt-BR')}${o.sentAt ? html`<div className="text-green-600">enviada ${new Date(o.sentAt).toLocaleString('pt-BR')}</div>` : ''}</td>
-                                                    <td className="p-3">${o.client?.name || '(sem cliente)'}</td>
-                                                    <td className="p-3 text-xs text-slate-600">${o.responsavel || '-'}</td>
-                                                    <td className="p-3 text-center text-xs">${(o.services||[]).length} serv. / ${(o.parts||[]).length} peças</td>
-                                                    <td className="p-3 text-right font-bold">R$ ${osTotal(o).toFixed(2)}</td>
+                                                    <td className="p-3 font-mono text-sm font-bold text-slate-800">${o.omieOsNumber || html`<span className="text-slate-400 font-normal text-xs">sem nº</span>`}</td>
+                                                    <td className="p-3">
+                                                        <div className="font-medium text-slate-800">${o.client?.name || '(sem cliente)'}</div>
+                                                        <div className="text-xs text-slate-400">${new Date(o.createdAt).toLocaleDateString('pt-BR')}${o.responsavel ? ' · ' + o.responsavel : ''}</div>
+                                                    </td>
+                                                    <td className="p-3">${col ? html`<span className=${`px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${col[1]}`}>${col[0]}</span>` : html`<span className="text-xs text-slate-400" title="Nenhum cartão do painel tem este nº de OS">fora do painel</span>`}</td>
                                                     <td className="p-3 text-center">
-                                                        ${o.status === 'sent' ? html`<span className="bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs font-bold">ENVIADA #${o.omieOsNumber || o.omieOsId}</span>` :
-                                                          o.sendError ? html`<span className="bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-bold" title=${o.sendError}>ERRO</span>` :
-                                                          html`<span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded text-xs font-bold">PENDENTE</span>`}
+                                                        ${o.status === 'sent' ? html`<span className="bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap">Enviado</span>` :
+                                                          o.sendError ? html`<span className="bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-bold" title=${o.sendError}>Erro</span>` :
+                                                          html`<span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap">Em preenchimento</span>`}
                                                         ${o.omieStatus ? html`<div className=${`mt-1 text-xs font-bold rounded px-2 py-0.5 inline-block ${o.omieStatus === 'faturada' ? 'bg-emerald-100 text-emerald-700' : (o.omieStatus === 'cancelada' || o.omieStatus === 'excluida') ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`} title=${o.omieEventAt ? 'Omie em ' + new Date(o.omieEventAt).toLocaleString('pt-BR') : ''}>Omie: ${o.omieStatus}</div>` : ''}
                                                     </td>
+                                                    <td className="p-3 text-center text-xs text-slate-600 whitespace-nowrap">${(o.services||[]).length} serv. / ${(o.parts||[]).length} peças</td>
+                                                    ${verTotal && html`<td className="p-3 text-right font-bold">R$ ${osTotal(o).toFixed(2)}</td>`}
                                                     <td className="p-3 text-right whitespace-nowrap">
-                                                        <button onClick=${() => abrirOsCompleta(o)} className="bg-blue-50 hover:bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs font-medium mr-1">${o.status === 'sent' ? 'Ver' : 'Editar'}</button>
-                                                        ${o.status !== 'sent' && html`<button onClick=${() => deleteOs(o.id)} className="bg-red-50 hover:bg-red-100 text-red-700 px-2 py-1 rounded text-xs font-medium"><i className="ph-bold ph-trash"></i></button>`}
+                                                        <button onClick=${() => abrirOsCompleta(o)} className="bg-blue-50 hover:bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs font-medium mr-1">${o.status === 'sent' ? 'Ver' : 'Abrir'}</button>
+                                                        ${o.status !== 'sent' && html`<button onClick=${() => deleteOs(o.id)} title="Excluir esta OS do Smart (não mexe no Omie)" className="bg-red-50 hover:bg-red-100 text-red-700 px-2 py-1 rounded text-xs font-medium"><i className="ph-bold ph-trash"></i></button>`}
                                                     </td>
-                                                </tr>
-                                            `)}
+                                                </tr>`;
+                                            })}
                                         </tbody>
                                     </table>
                                 </div>
                             `}
                         </div>
+
+                        <details className="bg-white rounded-xl shadow-sm border border-slate-200" onToggle=${ev => { const aberto = ev.target.open; setAbertasAberto(aberto); if (aberto) fetchOmieAbertas(); }}>
+                            <summary className="p-4 cursor-pointer font-semibold text-slate-700 flex items-center gap-2"><i className="ph-fill ph-cloud-arrow-down text-amber-600 text-xl"></i> OS abertas no Omie que ainda não estão no Smart</summary>
+                            <div className="px-4 pb-4">
+                                <div className="flex justify-between items-center mb-2 gap-2">
+                                    <p className="text-xs text-slate-500">OS recentes do Omie, ainda não faturadas nem canceladas. Importar traz a OS para o Smart.</p>
+                                    <button onClick=${fetchOmieAbertas} disabled=${loadingAbertas} className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded text-sm font-medium flex items-center gap-1 disabled:opacity-50 whitespace-nowrap">
+                                        <i className=${`ph-bold ph-arrows-clockwise ${loadingAbertas ? 'animate-spin' : ''}`}></i> ${loadingAbertas ? 'Carregando...' : 'Atualizar'}
+                                    </button>
+                                </div>
+                                ${loadingAbertas && !omieAbertas.length ? html`<div className="text-center py-6 text-sm text-slate-400"><i className="ph ph-spinner animate-spin"></i> Buscando no Omie…</div>` :
+                                  omieAbertas.length === 0 ? html`<div className="text-center py-6 text-sm text-slate-400">Nenhuma OS aberta encontrada nas páginas recentes do Omie.</div>` : html`
+                                    <div className="overflow-x-auto rounded border border-slate-200">
+                                        <table className="min-w-full text-sm">
+                                            <thead className="bg-amber-50 text-slate-700">
+                                                <tr>
+                                                    <th className="p-2 text-left">Nº OS</th>
+                                                    <th className="p-2 text-left">Cliente</th>
+                                                    <th className="p-2 text-left">Inclusão</th>
+                                                    <th className="p-2 text-right">Ação</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-slate-100">
+                                                ${omieAbertas.map(o => {
+                                                    const ja = osDrafts.find(d => d.omieOsId === o.nCodOS);
+                                                    return html`
+                                                    <tr key=${o.nCodOS} className="hover:bg-slate-50">
+                                                        <td className="p-2 font-mono text-xs font-bold">${o.cNumOS || '—'}</td>
+                                                        <td className="p-2 text-xs">
+                                                            <div className="font-medium text-slate-800">${o.clientName || '—'}</div>
+                                                            ${o.cContato && html`<div className="text-slate-500">contato: ${o.cContato}</div>`}
+                                                        </td>
+                                                        <td className="p-2 text-xs">${o.dDtInc || ''}</td>
+                                                        <td className="p-2 text-right">
+                                                            ${ja ? html`<button onClick=${() => abrirOsCompleta(ja)} className="bg-blue-50 hover:bg-blue-100 text-blue-700 px-3 py-1 rounded text-xs font-medium">Abrir</button>`
+                                                                 : html`<button onClick=${() => importarOsDoOmie(o.nCodOS)} className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1 rounded text-xs font-medium"><i className="ph-bold ph-download-simple"></i> Importar</button>`}
+                                                        </td>
+                                                    </tr>`;
+                                                })}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                `}
+                            </div>
+                        </details>
+
+                        <details className="bg-white rounded-xl shadow-sm border border-slate-200">
+                            <summary className="p-4 cursor-pointer font-semibold text-slate-700 flex items-center gap-2"><i className="ph-fill ph-magnifying-glass text-purple-600 text-xl"></i> Rastrear peça por nº de série</summary>
+                            <div className="px-4 pb-4">
+                                <p className="text-sm text-slate-500 mb-3">Numa reclamação de garantia, busque o número de série para ver em qual OS a peça foi instalada (nova) ou retirada (velha).</p>
+                                <div className="flex gap-2">
+                                    <input type="text" value=${serialBusca} onChange=${e => setSerialBusca(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') buscarSerial(); }} placeholder="Nº de série (mín. 3 caracteres)" className="flex-1 p-2 border border-slate-300 rounded-lg font-mono outline-none focus:ring-2 focus:ring-purple-400" />
+                                    <button onClick=${buscarSerial} className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg font-medium"><i className="ph-bold ph-magnifying-glass"></i> Buscar</button>
+                                </div>
+                                ${serialResultados === 'loading' && html`<div className="text-sm text-slate-500 mt-3"><i className="ph ph-spinner animate-spin"></i> Buscando...</div>`}
+                                ${Array.isArray(serialResultados) && (serialResultados.length === 0 ? html`<div className="text-sm text-slate-400 mt-3">Nenhuma peça encontrada com esse número de série.</div>` : html`
+                                    <div className="mt-3 overflow-x-auto rounded border border-slate-200">
+                                        <table className="min-w-full text-sm">
+                                            <thead className="bg-slate-100 text-slate-700"><tr><th className="p-2 text-left">Situação</th><th className="p-2 text-left">Nº Série</th><th className="p-2 text-left">Peça</th><th className="p-2 text-left">OS</th><th className="p-2 text-left">Cliente</th><th className="p-2 text-left">Data</th></tr></thead>
+                                            <tbody className="divide-y divide-slate-100">
+                                                ${serialResultados.map((r, idx) => html`<tr key=${idx} className="hover:bg-slate-50">
+                                                    <td className="p-2"><span className=${r.papel === 'instalada' ? 'bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap' : 'bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap'}>${r.papel === 'instalada' ? 'Instalada (nova)' : 'Retirada (velha)'}</span></td>
+                                                    <td className="p-2 font-mono text-xs">${r.serial}</td>
+                                                    <td className="p-2 text-xs">${r.peca}</td>
+                                                    <td className="p-2 text-xs font-mono">${r.osNumero}</td>
+                                                    <td className="p-2 text-xs">${r.cliente}</td>
+                                                    <td className="p-2 text-xs">${(r.data || '').slice(0, 10)}</td>
+                                                </tr>`)}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                `)}
+                            </div>
+                        </details>
                     </div>
                 `;
             };
