@@ -3087,6 +3087,38 @@ def _req_num(v, default=0.0):
         return default
 
 
+def _req_dados_os(full_data, user, os_id):
+    """Dados básicos da OS para a requisição (o almoxarife vê sem abrir a OS). Lidos no servidor, não vêm do cliente."""
+    if not os_id:
+        return {}
+    _owner, d = _find_filial_draft(full_data, user, os_id)
+    if not d:
+        return {}
+    num = str(d.get('omieOsNumber') or '').strip()
+    c = _painel_cartao_da_os(full_data, num) or {}
+    equip = ' '.join(x for x in (c.get('equipamento'), c.get('modelo')) if x) or ((d.get('fromLaudo') or {}).get('model') or '')
+    return {"osNumero": num, "cliente": c.get('cliente') or ((d.get('client') or {}).get('name') or ''),
+            "equipamento": equip, "serie": c.get('serie') or ''}
+
+
+def _req_pecas_da_os(full_data, user, os_id):
+    """{indice_da_peça_na_OS: {req, status, liberado, qtd, qtdAtendida}} das requisições desta OS (a mais recente
+    de cada peça; canceladas não contam). Alimenta o selo 'Peças liberadas' da bancada."""
+    if not os_id:
+        return {}
+    fil = _req_filial(full_data, user)
+    out = {}
+    for r in sorted(_req_lista(full_data), key=lambda x: x.get('criadoEm') or ''):
+        if r.get('osId') != os_id or (r.get('filialId') or 'matriz') != fil or r.get('status') == 'cancelada':
+            continue
+        for it in r.get('itens') or []:
+            pi = it.get('parteIdx')
+            if pi is not None:
+                out[str(pi)] = {"req": r.get('numero'), "status": r.get('status'), "liberado": bool(it.get('liberado')),
+                                "qtd": it.get('qtd'), "qtdAtendida": it.get('qtdAtendida')}
+    return out
+
+
 @app.route('/api/requisicoes', methods=['GET'])
 def req_listar():
     user, full_data, err = _require_user()
@@ -3114,6 +3146,8 @@ def req_criar():
             continue
         if qtd <= 0:
             return jsonify({"error": f"Quantidade inválida em: {desc}"}), 400
+        pi = it.get('parteIdx')
+        pi = int(pi) if isinstance(pi, (int, float)) and not isinstance(pi, bool) and pi >= 0 else None
         itens.append({
             "codigo": _req_txt(it.get('codigo'), 60),
             "descricao": desc,
@@ -3121,9 +3155,23 @@ def req_criar():
             "unidade": _req_txt(it.get('unidade'), 8) or 'UN',
             "obs": _req_txt(it.get('obs'), 200),
             "qtdAtendida": None,
+            "parteIdx": pi,          # posição da peça na OS (liga a requisição à OS)
+            "liberado": False,
         })
     if not itens:
         return jsonify({"error": "Adicione ao menos uma peça"}), 400
+    os_id = _req_txt(body.get('osId'), 80)
+    if os_id:   # a mesma peça da OS não vai duas vezes ao almoxarifado (recusada pode ser pedida de novo)
+        ja = {}
+        for x in _req_lista(full_data):
+            if x.get('osId') == os_id and x.get('status') not in ('cancelada', 'recusada'):
+                for xi in x.get('itens') or []:
+                    if xi.get('parteIdx') is not None:
+                        ja[xi['parteIdx']] = x.get('numero')
+        for it in itens:
+            if it['parteIdx'] is not None and it['parteIdx'] in ja:
+                return jsonify({"error": f"A peça \"{it['descricao']}\" já está na requisição {ja[it['parteIdx']]}."}), 400
+    dados_os = _req_dados_os(full_data, user, os_id)
     urg = body.get('urgencia') if body.get('urgencia') in REQ_URGENCIAS else 'normal'
     full_data['reqSeq'] = int(full_data.get('reqSeq') or 0) + 1
     now = datetime.utcnow().isoformat() + "Z"
@@ -3136,8 +3184,12 @@ def req_criar():
         "atualizadoEm": now,
         "status": "pendente",
         "urgencia": urg,
-        "osId": _req_txt(body.get('osId'), 80),
-        "osRotulo": _req_txt(body.get('osRotulo'), 160),
+        "osId": os_id,
+        "osRotulo": _req_txt(body.get('osRotulo'), 160) or (f"OS {dados_os['osNumero']} — {dados_os['cliente']}" if dados_os.get('osNumero') else ''),
+        "osNumero": dados_os.get('osNumero', ''),
+        "cliente": dados_os.get('cliente', ''),
+        "equipamento": dados_os.get('equipamento', ''),
+        "serie": dados_os.get('serie', ''),
         "observacao": _req_txt(body.get('observacao'), 500),
         "itens": itens,
         "resposta": "",
@@ -3185,6 +3237,7 @@ def req_acao(req_id):
         for i, it in enumerate(r['itens']):
             q = _req_num(qtds[i], it['qtd']) if i < len(qtds) and qtds[i] not in (None, '') else it['qtd']
             it['qtdAtendida'] = max(0.0, min(q, it['qtd']))
+            it['liberado'] = it['qtdAtendida'] > 0
         if all((it['qtdAtendida'] or 0) <= 0 for it in r['itens']):
             return jsonify({"error": "Nenhum item entregue — use Recusar"}), 400
         r['status'] = 'entregue'
@@ -3192,6 +3245,35 @@ def req_acao(req_id):
         r['resposta'] = _req_txt(body.get('resposta'), 300)
         parcial = any(it['qtdAtendida'] < it['qtd'] for it in r['itens'])
         _req_evento(r, user, 'entregue_parcial' if parcial else 'entregue', r['resposta'])
+    elif acao == 'liberar':
+        # Libera as peças SELECIONADAS pelo almoxarife: itens = [{idx, qtd}]. Sobrando item, a requisição
+        # continua aberta (em separação); liberou tudo -> 'entregue'.
+        if not aberta:
+            return jsonify({"error": "Requisição já encerrada"}), 400
+        agora = datetime.utcnow().isoformat() + "Z"
+        novos = 0
+        for sel in (body.get('itens') if isinstance(body.get('itens'), list) else []):
+            try:
+                idx = int(sel.get('idx'))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not (0 <= idx < len(r['itens'])) or r['itens'][idx].get('liberado'):
+                continue
+            it = r['itens'][idx]
+            q = max(0.0, min(_req_num(sel.get('qtd'), it['qtd']), it['qtd']))
+            if q <= 0:
+                continue
+            it.update({"liberado": True, "qtdAtendida": q, "liberadoEm": agora, "liberadoPor": user})
+            novos += 1
+        if not novos:
+            return jsonify({"error": "Selecione ao menos uma peça para liberar."}), 400
+        if body.get('retiradoPor'):
+            r['retiradoPor'] = _req_txt(body.get('retiradoPor'), 80)
+        if body.get('resposta'):
+            r['resposta'] = _req_txt(body.get('resposta'), 300)
+        todos = all(it.get('liberado') for it in r['itens'])
+        r['status'] = 'entregue' if todos else 'em_separacao'
+        _req_evento(r, user, 'liberada' if todos else 'liberada_parcial', r.get('resposta') or '')
     elif acao == 'recusar':
         if not aberta:
             return jsonify({"error": "Requisição já encerrada"}), 400
@@ -3207,6 +3289,7 @@ def req_acao(req_id):
         r['status'] = 'pendente'
         for it in r['itens']:
             it['qtdAtendida'] = None
+            it['liberado'] = False
         r['resposta'] = ''
         r['retiradoPor'] = ''
         _req_evento(r, user, 'reaberta')
@@ -3408,6 +3491,10 @@ def os_bancada():
             entry["osId"] = escolha.get('id')
             entry["os"] = _strip_part_photos(escolha)
             entry["resumo"] = _resumo_laudo(full_data, escolha_owner, escolha)
+            pr = _req_pecas_da_os(full_data, user, escolha.get('id'))
+            entry["pecasReq"] = pr                                            # por índice da peça na OS
+            entry["pecasReqTotal"] = len(pr)
+            entry["pecasLiberadas"] = sum(1 for v in pr.values() if v['liberado'])
         else:
             entry["osId"] = None
             entry["os"] = None
@@ -5649,7 +5736,10 @@ HTML_PAGE = """
             const [reqForm, setReqForm] = useState(null);           // null = formulário fechado
             const [reqBusca, setReqBusca] = useState({ idx: null, q: '', results: [], msg: '' });
             const [reqSaving, setReqSaving] = useState(false);
-            const [reqEntrega, setReqEntrega] = useState(null);     // {id, qtds:[], retiradoPor, resposta}
+            const [reqEntrega, setReqEntrega] = useState(null);     // {id, sel:[bool], qtds:[], retiradoPor, resposta}
+            const [reqSelPecas, setReqSelPecas] = useState({});     // {osId: {idx: true}} peças marcadas para pedir ao almoxarifado
+            const [reqGerando, setReqGerando] = useState(false);
+            const [reqUrgOs, setReqUrgOs] = useState('normal');
             const [filaRoboTs, setFilaRoboTs] = useState(null);      // horário da última atualização (feedback)
             const [filaRoboLoading, setFilaRoboLoading] = useState(false);
 
@@ -6086,11 +6176,32 @@ HTML_PAGE = """
                 await fetch('/api/requisicoes/' + r.id, { method: 'DELETE', headers: { 'Authorization': auth.token } });
                 fetchRequisicoes();
             };
+            // Almoxarife: libera só as peças marcadas (as demais ficam na requisição, que continua aberta)
             const reqConfirmarEntrega = async () => {
                 const r = requisicoes.find(x => x.id === reqEntrega.id);
                 if (!r) return;
-                const ok = await reqAcao(r, 'entregar', { qtds: reqEntrega.qtds, retiradoPor: reqEntrega.retiradoPor, resposta: reqEntrega.resposta });
+                const itens = reqEntrega.sel.map((on, k) => on ? { idx: k, qtd: reqEntrega.qtds[k] } : null).filter(Boolean);
+                if (!itens.length) { alert('Marque ao menos uma peça para liberar.'); return; }
+                const ok = await reqAcao(r, 'liberar', { itens, retiradoPor: reqEntrega.retiradoPor, resposta: reqEntrega.resposta });
                 if (ok) setReqEntrega(null);
+            };
+            // Técnico: gera a requisição das peças marcadas na OS (o almoxarifado vê os dados básicos da OS)
+            const gerarRequisicaoPecas = async (os, e) => {
+                const sel = reqSelPecas[os.id] || {};
+                const idxs = Object.keys(sel).filter(k => sel[k]).map(Number).sort((a, b) => a - b);
+                if (!idxs.length) { alert('Marque as peças que você precisa pedir ao almoxarifado.'); return; }
+                const itens = idxs.map(i => { const p = (os.parts || [])[i] || {}; return { codigo: p.code || '', descricao: p.description || p.code || 'peça', qtd: p.quantity || 1, unidade: 'UN', parteIdx: i }; });
+                if (!confirm('Enviar ao almoxarifado a requisição de ' + itens.length + ' peça(s) da OS ' + (os.omieOsNumber || '') + '?')) return;
+                setReqGerando(true);
+                try {
+                    const r = await fetch('/api/requisicoes', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth.token }, body: JSON.stringify({ osId: os.id, urgencia: reqUrgOs, itens }) });
+                    const d = await r.json();
+                    if (!r.ok) { alert(d.error || 'Erro ao gerar a requisição'); return; }
+                    setReqSelPecas(prev => ({ ...prev, [os.id]: {} }));
+                    fetchBancada(); fetchRequisicoes();
+                    alert('Requisição ' + d.numero + ' enviada ao almoxarifado.');
+                } catch (err) { alert('Erro de conexão'); }
+                finally { setReqGerando(false); }
             };
             const reqData = (iso) => { try { return new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } };
             const reqFmtQtd = (n) => (n === null || n === undefined) ? '' : String(Math.round(n * 1000) / 1000).replace('.', ',');
@@ -8166,7 +8277,7 @@ HTML_PAGE = """
                     recusada:     { t: 'Recusada',      c: 'bg-red-100 text-red-800 border-red-300' },
                     cancelada:    { t: 'Cancelada',     c: 'bg-slate-200 text-slate-600 border-slate-300' }
                 };
-                const ACAO_TXT = { criada: 'criou', em_separacao: 'iniciou a separação', entregue: 'entregou', entregue_parcial: 'entregou parcialmente', recusada: 'recusou', cancelada: 'cancelou', reaberta: 'reabriu' };
+                const ACAO_TXT = { criada: 'criou', em_separacao: 'iniciou a separação', entregue: 'entregou', entregue_parcial: 'entregou parcialmente', liberada: 'liberou as peças', liberada_parcial: 'liberou parte das peças', recusada: 'recusou', cancelada: 'cancelou', reaberta: 'reabriu' };
                 const todas = requisicoes || [];
                 const abertaSt = (r) => r.status === 'pendente' || r.status === 'em_separacao';
                 const qtdAbertas = todas.filter(abertaSt).length;
@@ -8255,11 +8366,19 @@ HTML_PAGE = """
                                 <div className="text-xs text-slate-500">${r.solicitanteNome}${meu ? ' (você)' : ''} · ${reqData(r.criadoEm)}</div>
                             </div>
                             <div className="text-xs text-slate-600 mt-1"><i className="ph-bold ph-clipboard-text"></i> ${r.osRotulo || 'Sem OS (uso interno)'}</div>
+                            ${r.osNumero ? html`
+                                <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2">
+                                    <div><div className="text-slate-400">OS</div><div className="font-mono font-bold text-slate-800">${r.osNumero}</div></div>
+                                    <div><div className="text-slate-400">Cliente</div><div className="font-medium text-slate-800">${r.cliente || '—'}</div></div>
+                                    <div><div className="text-slate-400">Equipamento</div><div className="font-medium text-slate-800">${r.equipamento || '—'}</div></div>
+                                    <div><div className="text-slate-400">Nº de série</div><div className="font-mono text-slate-800">${r.serie || '—'}</div></div>
+                                </div>` : ''}
                             <div className="mt-2 divide-y divide-slate-100 border border-slate-100 rounded-lg">
                                 ${r.itens.map((it, k) => html`
                                     <div key=${k} className="flex items-center justify-between gap-3 px-3 py-1.5 text-sm">
                                         <div className="min-w-0">
                                             <span className="font-mono text-xs text-slate-400">${it.codigo}</span> ${it.descricao}
+                                            ${it.liberado ? html`<span className="ml-1 text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">liberada</span>` : ''}
                                             ${it.obs && html`<div className="text-xs text-slate-500">${it.obs}</div>`}
                                         </div>
                                         <div className="whitespace-nowrap text-right font-medium">
@@ -8275,20 +8394,21 @@ HTML_PAGE = """
 
                             ${emEntrega && html`
                                 <div className="mt-3 p-3 bg-emerald-50 border border-emerald-200 rounded-lg space-y-2">
-                                    <div className="text-xs font-semibold text-emerald-800">Quantidade entregue de cada peça (reduza se for entrega parcial):</div>
+                                    <div className="text-xs font-semibold text-emerald-800">Marque as peças que você está liberando agora (a quantidade pode ser reduzida):</div>
                                     ${r.itens.map((it, k) => html`
-                                        <div key=${k} className="flex items-center gap-2 text-sm">
-                                            <input type="text" inputMode="decimal" value=${reqEntrega.qtds[k]} onInput=${e => { const q = [...reqEntrega.qtds]; q[k] = e.target.value; setReqEntrega({ ...reqEntrega, qtds: q }); }} className="w-20 p-1.5 border border-slate-300 rounded text-center bg-white" />
+                                        <label key=${k} className=${`flex items-center gap-2 text-sm ${it.liberado ? 'opacity-50' : 'cursor-pointer'}`}>
+                                            <input type="checkbox" disabled=${!!it.liberado} checked=${!!it.liberado || !!reqEntrega.sel[k]} onChange=${e => { const sl = [...reqEntrega.sel]; sl[k] = e.target.checked; setReqEntrega({ ...reqEntrega, sel: sl }); }} className="h-4 w-4 accent-emerald-600" />
+                                            <input type="text" inputMode="decimal" disabled=${!!it.liberado || !reqEntrega.sel[k]} value=${it.liberado ? reqFmtQtd(it.qtdAtendida) : reqEntrega.qtds[k]} onInput=${e => { const q = [...reqEntrega.qtds]; q[k] = e.target.value; setReqEntrega({ ...reqEntrega, qtds: q }); }} className="w-16 p-1 border border-slate-300 rounded text-center bg-white disabled:bg-slate-100" />
                                             <span className="text-xs text-slate-500">de ${reqFmtQtd(it.qtd)} ${it.unidade}</span>
-                                            <span className="truncate">${it.descricao}</span>
-                                        </div>`)}
+                                            <span className="truncate">${it.descricao}${it.liberado ? ' (já liberada)' : ''}</span>
+                                        </label>`)}
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                                         <input value=${reqEntrega.retiradoPor} onInput=${e => setReqEntrega({ ...reqEntrega, retiradoPor: e.target.value })} placeholder="Quem retirou (opcional)" className="p-2 border border-slate-300 rounded text-sm bg-white" />
                                         <input value=${reqEntrega.resposta} onInput=${e => setReqEntrega({ ...reqEntrega, resposta: e.target.value })} placeholder="Recado ao solicitante (opcional)" className="p-2 border border-slate-300 rounded text-sm bg-white" />
                                     </div>
                                     <div className="flex justify-end gap-2">
                                         <button onClick=${() => setReqEntrega(null)} className="px-3 py-1.5 text-sm text-slate-600 hover:bg-white rounded">Voltar</button>
-                                        <button onClick=${reqConfirmarEntrega} className="px-4 py-1.5 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded flex items-center gap-1"><i className="ph-bold ph-check"></i> Confirmar entrega</button>
+                                        <button onClick=${reqConfirmarEntrega} disabled=${!reqEntrega.sel.some(Boolean)} className="px-4 py-1.5 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed rounded flex items-center gap-1"><i className="ph-bold ph-check"></i> Liberar peças${reqEntrega.sel.some(Boolean) ? ' (' + reqEntrega.sel.filter(Boolean).length + ')' : ''}</button>
                                     </div>
                                 </div>`}
 
@@ -8299,7 +8419,7 @@ HTML_PAGE = """
                                 <div className="flex flex-wrap gap-2">
                                     <button onClick=${() => reqImprimir(r)} className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded flex items-center gap-1"><i className="ph-bold ph-printer"></i> Imprimir</button>
                                     ${reqAlmox && r.status === 'pendente' && html`<button onClick=${() => reqAcao(r, 'separar')} className="px-3 py-1.5 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded flex items-center gap-1"><i className="ph-bold ph-hand-grabbing"></i> Iniciar separação</button>`}
-                                    ${reqAlmox && aberta && !emEntrega && html`<button onClick=${() => setReqEntrega({ id: r.id, qtds: r.itens.map(it => String(it.qtd)), retiradoPor: '', resposta: '' })} className="px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded flex items-center gap-1"><i className="ph-bold ph-package"></i> Entregar</button>`}
+                                    ${reqAlmox && aberta && !emEntrega && html`<button onClick=${() => setReqEntrega({ id: r.id, sel: r.itens.map(it => !it.liberado), qtds: r.itens.map(it => String(it.qtd)), retiradoPor: '', resposta: '' })} className="px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded flex items-center gap-1"><i className="ph-bold ph-package"></i> Liberar peças</button>`}
                                     ${reqAlmox && aberta && html`<button onClick=${() => reqRecusar(r)} className="px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded">Recusar</button>`}
                                     ${aberta && (reqAlmox || (meu && r.status === 'pendente')) && html`<button onClick=${() => reqCancelar(r)} className="px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 rounded">Cancelar</button>`}
                                     ${reqAlmox && !aberta && html`<button onClick=${() => reqAcao(r, 'reabrir')} className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 rounded">Reabrir</button>`}
@@ -9357,18 +9477,13 @@ HTML_PAGE = """
             // uma marcação só, sem risco das duas telas divergirem.
             const controlesSubstituicao = (p, i, patch, foto) => html`
                 <div className="mt-3 pt-3 border-t border-dashed border-slate-300">
-                    <label className="flex items-center gap-2 cursor-pointer text-sm font-medium text-slate-700">
-                        <input type="checkbox" checked=${p.substituida || false} onChange=${e => patch(i, { substituida: e.target.checked })} className="w-4 h-4 text-amber-600" />
-                        <i className="ph-bold ph-arrows-left-right text-amber-600"></i> Peça substituída — registrar troca (nº de série)
-                    </label>
-                    ${p.substituida && html`
+                    <div className="flex items-center flex-wrap gap-x-4 gap-y-1 text-sm text-slate-600">
+                        <span className="font-medium flex items-center gap-1"><i className="ph-bold ph-arrows-left-right text-amber-600"></i> Esta peça tem número de série?</span>
+                        <label className="flex items-center gap-1 cursor-pointer"><input type="radio" checked=${p.temSerie === true} onChange=${() => patch(i, { substituida: true, temSerie: true })} className="accent-emerald-600" /> Sim</label>
+                        <label className="flex items-center gap-1 cursor-pointer"><input type="radio" checked=${p.temSerie === false} onChange=${() => patch(i, { substituida: true, temSerie: false })} className="accent-emerald-600" /> Não</label>
+                    </div>
+                    ${p.temSerie === true && html`
                         <div className="mt-3">
-                            <div className="flex items-center gap-4 text-sm text-slate-600 mb-2">
-                                <span className="font-medium">Esta peça tem número de série?</span>
-                                <label className="flex items-center gap-1 cursor-pointer"><input type="radio" checked=${p.temSerie === true} onChange=${() => patch(i, { temSerie: true })} className="accent-emerald-600" /> Sim</label>
-                                <label className="flex items-center gap-1 cursor-pointer"><input type="radio" checked=${p.temSerie === false} onChange=${() => patch(i, { temSerie: false })} className="accent-emerald-600" /> Não</label>
-                            </div>
-                            ${p.temSerie === true ? html`
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                                 <div className="bg-red-50 border border-red-200 rounded-lg p-3">
                                     <div className="text-xs font-bold text-red-700 uppercase mb-1"><i className="ph-fill ph-wrench"></i> Peça retirada (velha)</div>
@@ -9381,7 +9496,6 @@ HTML_PAGE = """
                                     ${p.fotoSerialNovo ? html`<div className="relative"><img src=${p.fotoSerialNovo} className="w-full h-28 object-contain border rounded bg-white" /><button onClick=${() => patch(i, { fotoSerialNovo: null })} className="absolute top-1 right-1 bg-red-500 text-white rounded-full w-6 h-6 text-xs"><i className="ph ph-x"></i></button></div>` : html`<label className="flex items-center justify-center gap-1 text-xs bg-white border border-dashed border-emerald-300 rounded p-3 cursor-pointer text-emerald-600 hover:bg-emerald-50"><i className="ph-bold ph-camera"></i> Foto do nº de série<input type="file" accept="image/*" capture="environment" className="hidden" onChange=${e => foto(i, 'fotoSerialNovo', e.target.files[0])} /></label>`}
                                 </div>
                             </div>
-                            ` : (p.temSerie === false ? html`<div className="text-xs text-slate-500 italic bg-slate-50 border border-slate-200 rounded p-2">Peça sem número de série — troca registrada sem serial.</div>` : html`<div className="text-xs text-amber-600"><i className="ph-bold ph-arrow-up"></i> Selecione se a peça tem número de série.</div>`)}
                         </div>
                     `}
                 </div>`;
@@ -9516,6 +9630,25 @@ HTML_PAGE = """
             };
 
             const renderServicosExecutar = () => {
+                // Resumo das peças requisitadas desta OS (vem de /api/os/bancada em e.pecasReq, por índice da peça)
+                const resumoReq = (e) => {
+                    const v = Object.values(e.pecasReq || {});
+                    const lib = v.filter(x => x.liberado).length, aguard = v.filter(x => !x.liberado && x.status !== 'recusada').length;
+                    return { total: v.length, lib, aguard, rec: v.length - lib - aguard };
+                };
+                const seloReq = (e) => {
+                    const r = resumoReq(e);
+                    if (!r.total) return '';
+                    if (r.lib === r.total) return html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 whitespace-nowrap"><i className="ph-fill ph-check-circle"></i> Peças liberadas</span>`;
+                    if (r.lib > 0) return html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-amber-100 text-amber-700 whitespace-nowrap">Peças liberadas ${r.lib}/${r.total}</span>`;
+                    if (r.aguard > 0) return html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-blue-100 text-blue-700 whitespace-nowrap"><i className="ph-fill ph-hourglass"></i> Aguardando almoxarifado</span>`;
+                    return html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-red-100 text-red-700 whitespace-nowrap">Requisição recusada</span>`;
+                };
+                const seloPeca = (rq) => rq.liberado
+                    ? html`<span className="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 whitespace-nowrap"><i className="ph-fill ph-check-circle"></i> Peça liberada</span>`
+                    : rq.status === 'recusada'
+                        ? html`<span className="text-xs font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-700 whitespace-nowrap">Recusada (${rq.req})</span>`
+                        : html`<span className=${`text-xs font-bold px-2 py-0.5 rounded-full whitespace-nowrap ${rq.status === 'em_separacao' ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'}`}>${rq.status === 'em_separacao' ? 'Em separação' : 'Requisitada'} · ${rq.req}</span>`;
                 const visiveis = bancadaOps.filter(e => casaBusca(bancadaBusca, e.osNum, e.cliente, e.equipamento, e.serie));
                 const aprovadas = visiveis.filter(e => e.painelCol !== 'exec');   // Fila de Manutenção (aprovadas)
                 const emExecucao = visiveis.filter(e => e.painelCol === 'exec');   // Em Execução
@@ -9554,8 +9687,9 @@ HTML_PAGE = """
                                         </div>
                                     ` : ''}
                                 </div>
-                                <div className="flex items-center gap-3 flex-shrink-0">
+                                <div className="flex items-center justify-end gap-2 flex-wrap flex-shrink-0">
                                     ${reprovado ? html`<span className="text-xs font-bold px-2 py-1 rounded-full bg-red-100 text-red-700 whitespace-nowrap">Reprovado no teste</span>` : ''}
+                                    ${seloReq(e)}
                                     <span className=${`text-xs font-bold px-2 py-1 rounded-full ${completo ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>
                                         ${prog.feitos}/${prog.total}
                                     </span>
@@ -9622,20 +9756,49 @@ HTML_PAGE = """
                                             <div className="space-y-2">
                                                 ${(os.parts || []).map((p, i) => {
                                                     const feito = !!(os.checklistPecas || [])[i];
+                                                    const rq = (e.pecasReq || {})[String(i)];
+                                                    const podePedir = !!e.osId && (!rq || rq.status === 'recusada');
+                                                    const marcada = !!((reqSelPecas[os.id] || {})[i]);
                                                     return html`
                                                         <div key=${i} className="p-3 rounded-lg bg-white border border-slate-200">
-                                                            <label className="flex items-start gap-2 cursor-pointer">
-                                                                <input type="checkbox" checked=${feito} onChange=${() => execToggle('peca', i)} className="mt-0.5 h-4 w-4 accent-emerald-600 flex-shrink-0" />
-                                                                <span className=${`text-sm ${feito ? 'line-through text-slate-400' : 'text-slate-700'}`}>
-                                                                    ${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}
-                                                                </span>
-                                                            </label>
+                                                            <div className="flex items-start justify-between gap-3">
+                                                                <label className="flex items-start gap-2 cursor-pointer">
+                                                                    <input type="checkbox" checked=${feito} onChange=${() => execToggle('peca', i)} className="mt-0.5 h-4 w-4 accent-emerald-600 flex-shrink-0" />
+                                                                    <span className=${`text-sm ${feito ? 'line-through text-slate-400' : 'text-slate-700'}`}>
+                                                                        ${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}
+                                                                    </span>
+                                                                </label>
+                                                                <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                                                                    ${rq ? seloPeca(rq) : ''}
+                                                                    ${podePedir ? html`
+                                                                        <label className="flex items-center gap-1 text-xs text-orange-700 font-medium cursor-pointer">
+                                                                            <input type="checkbox" checked=${marcada} onChange=${ev => setReqSelPecas(prev => ({ ...prev, [os.id]: { ...(prev[os.id] || {}), [i]: ev.target.checked } }))} className="h-3.5 w-3.5 accent-orange-500" /> Pedir ao almoxarifado
+                                                                        </label>` : ''}
+                                                                </div>
+                                                            </div>
                                                             ${controlesSubstituicao(p, i, execPatchPeca, execFotoPeca)}
                                                         </div>`;
                                                 })}
                                             </div>
                                         `}
                                     </div>
+
+                                    ${(os.parts || []).length && e.osId ? (() => {
+                                        const nSel = Object.keys(reqSelPecas[os.id] || {}).filter(k => (reqSelPecas[os.id] || {})[k]).length;
+                                        return html`
+                                            <div className="flex flex-wrap items-center justify-between gap-2 bg-orange-50 border border-orange-200 rounded-lg p-3">
+                                                <div className="text-xs text-orange-800 min-w-0"><i className="ph-fill ph-package"></i> Marque <b>Pedir ao almoxarifado</b> nas peças de que precisa e gere a requisição. O almoxarifado vê os dados da OS e libera as peças.</div>
+                                                <div className="flex items-center gap-2">
+                                                    <select value=${reqUrgOs} onChange=${ev => setReqUrgOs(ev.target.value)} className=${`p-1.5 border rounded text-xs bg-white ${reqUrgOs === 'urgente' ? 'border-red-400 text-red-700 font-bold' : 'border-slate-300'}`}>
+                                                        <option value="normal">Normal</option>
+                                                        <option value="urgente">Urgente</option>
+                                                    </select>
+                                                    <button onClick=${() => gerarRequisicaoPecas(os, e)} disabled=${reqGerando || nSel === 0} className="bg-orange-500 hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-bold text-sm flex items-center gap-2">
+                                                        <i className="ph-bold ph-paper-plane-tilt"></i> ${reqGerando ? 'Enviando…' : 'Gerar requisição de peças' + (nSel ? ' (' + nSel + ')' : '')}
+                                                    </button>
+                                                </div>
+                                            </div>`;
+                                    })() : ''}
 
                                     ${(os.parts || []).length ? html`
                                         <div className="flex justify-end pt-1">
