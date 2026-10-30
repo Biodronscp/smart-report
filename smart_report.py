@@ -256,6 +256,7 @@ def _latest_backup():
 # O contrato externo (base64) é preservado: save externaliza, load/export reinflam.
 ASSET_DIR = os.path.join(os.path.dirname(DATA_FILE) or '.', 'laudo_assets')
 LAUDO_PDF_DIR = os.path.join(os.path.dirname(DATA_FILE) or '.', 'laudos_pdf')
+MIDIA_DIR = os.path.join(os.path.dirname(DATA_FILE) or '.', 'testes_midia')   # fotos/vídeos dos testes (por OS)
 
 
 def _safe_name(s):
@@ -3685,6 +3686,158 @@ def os_corrigir(os_id):
     return jsonify(draft)
 
 
+# ==========================================================
+#  FOTOS E VÍDEOS DO TESTE (Teste e Liberação)
+#  Os arquivos ficam no disco persistente (MIDIA_DIR/<OS>/<id>.<ext>); no JSON da OS fica só a lista
+#  leve em draft['testeMidias'] (nome, tipo, tamanho, quem/quando). Vídeo no JSON travaria o sistema.
+# ==========================================================
+MIDIA_MAX_FOTO = 15 * 1024 * 1024
+MIDIA_MAX_VIDEO = 50 * 1024 * 1024
+MIDIA_MAX_POR_OS = 20
+MIDIA_MAX_TOTAL = int(os.environ.get("MIDIA_MAX_TOTAL_MB", "600")) * 1024 * 1024   # teto de todas as mídias no disco
+
+
+def _midia_tipo(head):
+    """Identifica o arquivo pelos primeiros bytes (não confia no nome nem no tipo que o navegador diz).
+    Devolve (tipo, mime, extensão) ou None se não for foto/vídeo aceito."""
+    if head[:3] == b'\xff\xd8\xff':
+        return 'foto', 'image/jpeg', 'jpg'
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'foto', 'image/png', 'png'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return 'foto', 'image/webp', 'webp'
+    if head[4:8] == b'ftyp':
+        marca = head[8:12]
+        if marca in (b'heic', b'heix', b'hevc', b'hevx', b'mif1', b'msf1', b'avif'):
+            return None   # HEIC/AVIF: o navegador não exibe
+        if marca == b'qt  ':
+            return 'video', 'video/quicktime', 'mov'
+        return 'video', 'video/mp4', 'mp4'
+    if head[:4] == b'\x1a\x45\xdf\xa3':
+        return 'video', 'video/webm', 'webm'
+    return None
+
+
+def _midia_total_bytes():
+    total = 0
+    for raiz, _d, arqs in os.walk(MIDIA_DIR):
+        for a in arqs:
+            try:
+                total += os.path.getsize(os.path.join(raiz, a))
+            except OSError:
+                pass
+    return total
+
+
+def _midia_pasta(os_id):
+    return os.path.join(MIDIA_DIR, _safe_name(os_id))
+
+
+@app.route('/api/os/<os_id>/teste-midia', methods=['POST'])
+def os_teste_midia_enviar(os_id):
+    """Anexa uma foto ou vídeo do teste à OS (multipart, campo 'file'; opcional 'legenda')."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    owner, draft = _find_filial_draft(full_data, user, os_id)
+    if not draft:
+        return jsonify({"error": "OS não encontrada"}), 404
+    f = request.files.get('file')
+    if not f:
+        return jsonify({"error": "Nenhum arquivo enviado."}), 400
+    lista = draft.setdefault('testeMidias', [])
+    if len(lista) >= MIDIA_MAX_POR_OS:
+        return jsonify({"error": f"Limite de {MIDIA_MAX_POR_OS} anexos por OS. Exclua algum para anexar outro."}), 400
+    head = f.stream.read(16)
+    info = _midia_tipo(head)
+    if not info:
+        return jsonify({"error": "Formato não aceito. Envie foto (JPG, PNG, WebP) ou vídeo (MP4, MOV, WebM)."}), 400
+    tipo, mime, ext = info
+    limite = MIDIA_MAX_VIDEO if tipo == 'video' else MIDIA_MAX_FOTO
+    if _midia_total_bytes() > MIDIA_MAX_TOTAL:
+        return jsonify({"error": "O espaço de anexos do servidor está cheio. Avise o administrador."}), 507
+    mid = 'm_' + secrets.token_hex(6)
+    pasta = _midia_pasta(os_id)
+    os.makedirs(pasta, exist_ok=True)
+    destino = os.path.join(pasta, f"{mid}.{ext}")
+    tamanho = len(head)
+    try:
+        with open(destino, 'wb') as out:
+            out.write(head)
+            while True:
+                bloco = f.stream.read(1024 * 1024)
+                if not bloco:
+                    break
+                tamanho += len(bloco)
+                if tamanho > limite:
+                    raise ValueError(f"O {'vídeo' if tipo == 'video' else 'arquivo'} passa de {limite // (1024 * 1024)} MB.")
+                out.write(bloco)
+    except ValueError as e:
+        try:
+            os.remove(destino)
+        except OSError:
+            pass
+        return jsonify({"error": str(e)}), 413
+    except OSError as e:
+        print(f"[MIDIA] falha ao gravar: {e}", flush=True)
+        try:
+            os.remove(destino)
+        except OSError:
+            pass
+        return jsonify({"error": "Não foi possível gravar o arquivo no servidor."}), 500
+    agora = datetime.utcnow().isoformat() + "Z"
+    lista.append({
+        "id": mid, "tipo": tipo, "mime": mime, "ext": ext, "nome": _safe_name(f.filename or f"{tipo}.{ext}")[:80],
+        "tamanho": tamanho, "legenda": _req_txt(request.form.get('legenda'), 120),
+        "em": agora, "por": user, "porNome": _responsavel_nome(full_data, user),
+    })
+    draft['updatedAt'] = agora
+    save_data(full_data)
+    return jsonify({"success": True, "midias": lista})
+
+
+@app.route('/api/os/<os_id>/teste-midia/<mid>', methods=['GET'])
+def os_teste_midia_ver(os_id, mid):
+    from flask import send_file
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    owner, draft = _find_filial_draft(full_data, user, os_id)
+    m = next((x for x in (draft or {}).get('testeMidias') or [] if x.get('id') == mid), None)
+    if not m:
+        return jsonify({"error": "Anexo não encontrado"}), 404
+    caminho = os.path.join(_midia_pasta(os_id), f"{_safe_name(mid)}.{_safe_name(m.get('ext') or '')}")
+    if not os.path.isfile(caminho):
+        return jsonify({"error": "Arquivo não encontrado no servidor"}), 404
+    resp = send_file(caminho, mimetype=m.get('mime') or 'application/octet-stream', conditional=True, download_name=m.get('nome') or None)
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['Cache-Control'] = 'private, max-age=3600'
+    return resp
+
+
+@app.route('/api/os/<os_id>/teste-midia/<mid>', methods=['DELETE'])
+def os_teste_midia_excluir(os_id, mid):
+    """Quem anexou, ou o administrador, pode excluir."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    owner, draft = _find_filial_draft(full_data, user, os_id)
+    lista = (draft or {}).get('testeMidias') or []
+    m = next((x for x in lista if x.get('id') == mid), None)
+    if not m:
+        return jsonify({"error": "Anexo não encontrado"}), 404
+    if m.get('por') != user and (full_data['users'][user].get('role') or 'user') != 'admin':
+        return jsonify({"error": "Só quem anexou ou o administrador pode excluir."}), 403
+    draft['testeMidias'] = [x for x in lista if x.get('id') != mid]
+    try:
+        os.remove(os.path.join(_midia_pasta(os_id), f"{_safe_name(mid)}.{_safe_name(m.get('ext') or '')}"))
+    except OSError:
+        pass
+    draft['updatedAt'] = datetime.utcnow().isoformat() + "Z"
+    save_data(full_data)
+    return jsonify({"success": True, "midias": draft['testeMidias']})
+
+
 @app.route('/api/os/<os_id>/exec-checklist', methods=['POST'])
 def os_exec_checklist(os_id):
     """Salva o checklist de execução (quais serviços já foram feitos / peças já trocadas).
@@ -3793,6 +3946,11 @@ def os_delete(os_id):
             x for x in full_data['userStates'][owner]['osDrafts'] if x.get('id') != os_id
         ]
         save_data(full_data)
+        try:
+            import shutil
+            shutil.rmtree(_midia_pasta(os_id), ignore_errors=True)   # anexos do teste dessa OS
+        except Exception:
+            pass
     return jsonify({"success": True})
 
 
@@ -5679,6 +5837,54 @@ HTML_PAGE = """
         const html = htm.bind(React.createElement);
         const NOME_PERFIL = { user: 'Manutenção (técnico)', almoxarife: 'Almoxarife', vendedor: 'Vendedor', expedicao: 'Expedição', admin: 'Administrador', admin_master: 'Administrador Master' };
 
+        // Um anexo do teste. A foto carrega sozinha (miniatura); o vídeo só quando a pessoa clica em "Ver vídeo" (pode ter 50 MB).
+        // Buscamos o arquivo com o cabeçalho de login e mostramos por um endereço temporário: o token não vai na URL.
+        const MidiaItem = ({ osId, m, token, podeExcluir, onExcluir }) => {
+            const [url, setUrl] = useState(null);
+            const [carregando, setCarregando] = useState(false);
+            const [erro, setErro] = useState('');
+            const [grande, setGrande] = useState(false);
+            const carregar = async () => {
+                if (url || carregando) return;
+                setCarregando(true);
+                try {
+                    const r = await fetch('/api/os/' + osId + '/teste-midia/' + m.id, { headers: { 'Authorization': token } });
+                    if (!r.ok) throw new Error('falha');
+                    setUrl(URL.createObjectURL(await r.blob()));
+                } catch (e) { setErro('Não foi possível carregar.'); }
+                setCarregando(false);
+            };
+            useEffect(() => { if (m.tipo === 'foto') carregar(); }, [m.id]);
+            useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+            const mb = (m.tamanho / 1048576).toFixed(1).replace('.', ',');
+            let quando = '';
+            try { quando = new Date(m.em).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (e) {}
+            return html`
+                <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+                    <div className="bg-slate-100 flex items-center justify-center min-h-[7rem]">
+                        ${erro ? html`<span className="text-xs text-red-500 p-2 text-center">${erro}</span>` :
+                          m.tipo === 'foto'
+                            ? (url ? html`<img src=${url} onClick=${() => setGrande(true)} className="w-full h-28 object-cover cursor-zoom-in" alt=${m.nome} />` : html`<i className="ph ph-spinner animate-spin text-slate-400"></i>`)
+                            : (url ? html`<video src=${url} controls preload="metadata" className="w-full max-h-64 bg-black"></video>` :
+                                html`<button onClick=${carregar} disabled=${carregando} className="text-sm font-medium text-indigo-700 hover:text-indigo-900 flex flex-col items-center gap-1 p-3">
+                                    <i className=${'ph-fill ' + (carregando ? 'ph-spinner animate-spin' : 'ph-play-circle') + ' text-3xl'}></i>
+                                    ${carregando ? 'Carregando…' : 'Ver vídeo (' + mb + ' MB)'}
+                                </button>`)}
+                    </div>
+                    <div className="p-2 text-[11px] text-slate-500 flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                            <div className="truncate text-slate-700 font-medium">${m.legenda || m.nome}</div>
+                            <div className="truncate">${m.porNome || m.por} · ${quando}</div>
+                        </div>
+                        ${podeExcluir ? html`<button onClick=${() => onExcluir(m)} title="Excluir este anexo" className="text-red-400 hover:text-red-600 p-1"><i className="ph-bold ph-trash"></i></button>` : ''}
+                    </div>
+                    ${grande && url ? html`
+                        <div onClick=${() => setGrande(false)} className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 cursor-zoom-out">
+                            <img src=${url} className="max-w-full max-h-full object-contain" alt=${m.nome} />
+                        </div>` : ''}
+                </div>`;
+        };
+
         const App = () => {
             // Autenticação
             const [auth, setAuth] = useState(() => {
@@ -5796,6 +6002,7 @@ HTML_PAGE = """
             // Aba "Teste e Liberação" (execEstado === 'aguardando_teste')
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
+            const [midiaEnviando, setMidiaEnviando] = useState(null);   // id da OS que está recebendo anexos
             const [testeReprovando, setTesteReprovando] = useState(false);
             const [testeCondenando, setTesteCondenando] = useState(false);
             const [testeLiberando, setTesteLiberando] = useState(false);
@@ -9368,6 +9575,8 @@ HTML_PAGE = """
                                                 <textarea value=${o.obsTeste || ''} onInput=${e => testeSetObs(o, e.target.value)} onBlur=${e => testeSalvarCampos(o.id, { obsTeste: e.target.value })} rows="3" placeholder="Como o equipamento se comportou no teste, medições, ressalvas…" className="w-full p-3 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-cyan-500"></textarea>
                                             </div>
 
+                                            ${blocoMidias(o, true)}
+
                                             ${testeReprovando || !aberta ? '' : html`
                                                 <div className="bg-red-50 border border-red-200 rounded-lg p-3">
                                                     <label className="text-xs font-bold text-red-700 uppercase block mb-1">Se o teste NÃO passou, escreva o motivo (vale para reprovar ou condenar)</label>
@@ -9396,6 +9605,77 @@ HTML_PAGE = """
             };
 
             // ---- Aba "Histórico" (equipamentos liberados) ----------------------------
+            // ---- Fotos e vídeos do teste (guardados na OS para consulta futura) ----
+            const atualizarMidiasLocal = (osId, lista) => {
+                setCurrentOs(prev => prev && prev.id === osId ? { ...prev, testeMidias: lista } : prev);
+                setOsDrafts(prev => (prev || []).map(o => o.id === osId ? { ...o, testeMidias: lista } : o));
+            };
+            const enviarMidiasTeste = async (osId, fileList) => {
+                const arquivos = Array.from(fileList || []);
+                if (!arquivos.length) return;
+                setMidiaEnviando(osId);
+                let lista = null;
+                const erros = [];
+                for (const arq of arquivos) {
+                    try {
+                        let blob = arq, nome = arq.name;
+                        if ((arq.type || '').startsWith('image/')) {   // foto: reduz (1600 px) antes de enviar; celular manda 5-10 MB
+                            try {
+                                const dataUrl = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(arq); });
+                                const comp = await compressImage(dataUrl, 1600);
+                                blob = await (await fetch(comp)).blob();
+                                nome = nome.replace(/\\.[^.]+$/, '') + '.jpg';
+                            } catch (e) { blob = arq; }
+                        } else if (arq.size > 50 * 1024 * 1024) {
+                            erros.push(arq.name + ': o vídeo passa de 50 MB (grave um mais curto ou em qualidade menor).');
+                            continue;
+                        }
+                        const fd = new FormData();
+                        fd.append('file', blob, nome);
+                        const r = await fetch('/api/os/' + osId + '/teste-midia', { method: 'POST', headers: { 'Authorization': auth.token }, body: fd });
+                        let d = null;
+                        try { d = await r.json(); } catch (e) {}
+                        if (!r.ok || !d || !d.success) erros.push(arq.name + ': ' + ((d && d.error) || (r.status === 413 ? 'arquivo grande demais' : 'falha no envio')));
+                        else lista = d.midias;
+                    } catch (e) { erros.push(arq.name + ': erro de conexão'); }
+                }
+                setMidiaEnviando(null);
+                if (lista) { atualizarMidiasLocal(osId, lista); fetchTeste(); }
+                if (erros.length) alert('Alguns anexos não foram enviados:\\n\\n' + erros.join('\\n'));
+            };
+            const excluirMidiaTeste = async (osId, m) => {
+                if (!confirm('Excluir este anexo (' + (m.legenda || m.nome) + ')?\\n\\nNão dá para desfazer.')) return;
+                try {
+                    const r = await fetch('/api/os/' + osId + '/teste-midia/' + m.id, { method: 'DELETE', headers: { 'Authorization': auth.token } });
+                    const d = await r.json();
+                    if (!r.ok || !d.success) { alert(d.error || 'Erro ao excluir'); return; }
+                    atualizarMidiasLocal(osId, d.midias);
+                    fetchTeste();
+                } catch (e) { alert('Erro de conexão'); }
+            };
+            // anexar=true mostra o botão de anexar; sem anexos e sem anexar não mostra nada
+            const blocoMidias = (o, anexar) => {
+                const lista = o.testeMidias || [];
+                if (!lista.length && !anexar) return '';
+                const enviando = midiaEnviando === o.id;
+                return html`
+                    <div className="border border-slate-200 rounded-lg p-3 bg-slate-50">
+                        <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
+                            <div className="text-sm font-bold text-slate-700 flex items-center gap-1"><i className="ph-fill ph-camera text-indigo-600"></i> Fotos e vídeos do teste <span className="text-xs font-normal text-slate-400">(${lista.length})</span></div>
+                            ${anexar ? html`
+                                <label className=${`cursor-pointer bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 ${enviando ? 'opacity-60 pointer-events-none' : ''}`}>
+                                    <i className=${'ph-bold ' + (enviando ? 'ph-spinner animate-spin' : 'ph-paperclip')}></i> ${enviando ? 'Enviando…' : 'Anexar fotos / vídeos'}
+                                    <input type="file" accept="image/*,video/*" multiple className="hidden" onChange=${ev => { enviarMidiasTeste(o.id, ev.target.files); ev.target.value = ''; }} />
+                                </label>` : ''}
+                        </div>
+                        ${lista.length ? html`
+                            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                                ${lista.map(m => html`<${MidiaItem} key=${m.id} osId=${o.id} m=${m} token=${auth.token} podeExcluir=${m.por === auth.username || auth.role === 'admin'} onExcluir=${(x) => excluirMidiaTeste(o.id, x)} />`)}
+                            </div>` : html`<p className="text-xs text-slate-400">Nenhum anexo ainda. Registre o teste com fotos ou vídeos; ficam guardados nesta OS.</p>`}
+                        ${anexar ? html`<p className="text-[11px] text-slate-400 mt-2">Fotos (JPG, PNG, WebP) e vídeos (MP4, MOV, WebM até 50 MB). Até 20 anexos por OS.</p>` : ''}
+                    </div>`;
+            };
+
             const renderHistorico = () => {
                 const todosHist = (osDrafts || []).filter(o => o.execEstado === 'aprovado' || o.execEstado === 'condenado');
                 const lista = todosHist
@@ -9464,6 +9744,7 @@ HTML_PAGE = """
                                                     <p className="text-slate-700 whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded p-2 text-xs">${o.obsTeste}</p>
                                                 </div>
                                             ` : ''}
+                                            ${blocoMidias(o, false)}
                                         </div>
                                     `}
                                 </div>`;
@@ -10347,6 +10628,9 @@ HTML_PAGE = """
                                     </div>
                                 `}
                             </div>
+
+                            ${currentOs.id && ((currentOs.testeMidias || []).length || ['aguardando_teste', 'aprovado', 'reprovado', 'condenado'].includes(currentOs.execEstado)) ? html`
+                                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">${blocoMidias(currentOs, true)}</div>` : ''}
 
                             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
                                 <h3 className="text-lg font-semibold mb-3 text-slate-800 flex items-center gap-2"><i className="ph-fill ph-note text-blue-600 text-xl"></i> Observações</h3>
