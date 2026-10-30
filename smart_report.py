@@ -2455,10 +2455,11 @@ def omie_status():
     user, full_data, err = _require_user()
     if err:
         return err
-    has_key = bool(os.environ.get("OMIE_APP_KEY"))
-    has_secret = bool(os.environ.get("OMIE_APP_SECRET"))
+    # Mesmas credenciais que omie_call usa: as da filial do usuário (g), com fallback para as variáveis de ambiente.
+    has_key = bool(getattr(g, 'omie_app_key', None) or os.environ.get("OMIE_APP_KEY"))
+    has_secret = bool(getattr(g, 'omie_app_secret', None) or os.environ.get("OMIE_APP_SECRET"))
     if not has_key or not has_secret:
-        return jsonify({"configured": False, "ok": False, "message": "Credenciais Omie não configuradas no servidor."})
+        return jsonify({"configured": False, "ok": False, "message": "Credenciais Omie não configuradas para esta filial."})
     # Faz um ping de baixo custo: lista 1 cliente
     try:
         omie_call('/geral/clientes/', 'ListarClientes', {
