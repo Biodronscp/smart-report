@@ -2170,26 +2170,38 @@ def os_importar_omie():
     return erro if erro else jsonify(draft)
 
 
+_OS_NUM_MISS = {}   # (filial, número) -> instante da última busca sem resultado (cache negativo curto)
+
+
+def _omie_os_absorve(idx, resp):
+    for o in resp.get('osCadastro') or []:
+        cab = o.get('Cabecalho') or {}
+        n = str(cab.get('cNumOS') or '').strip()
+        if n:
+            idx[n] = {"nCodOS": cab.get('nCodOS'), "cEtapa": cab.get('cEtapa') or ''}
+
+
+def _omie_os_pagina(pagina):
+    return omie_call('/servicos/os/', 'ListarOS', {"pagina": pagina, "registros_por_pagina": 50,
+                                                   "apenas_importado_api": "N"}, timeout=40)
+
+
 def _omie_os_indice(forcar=False):
-    """Número da OS (cNumOS) -> {nCodOS, cEtapa}, varrendo ListarOS (em cache). O número é o que o vendedor
-    digita no cartão do painel; o Omie não filtra por ele de forma confiável, então indexamos tudo."""
+    """Número da OS (cNumOS) -> {nCodOS, cEtapa}, varrendo ListarOS. O número é o que o vendedor digita no cartão do
+    painel; o Omie não filtra por ele de forma confiável, então indexamos tudo. A varredura completa é lenta (~30 s):
+    por isso o índice NÃO expira (nCodOS de uma OS nunca muda) e OS novas entram por _omie_os_busca_nova()."""
     ck = 'os_indice_numero'
     if not forcar:
-        hit = _cache_get(ck)
-        if hit is not None:
-            return hit
+        item = _omie_cache.get(_cache_fkey(ck))   # ignora o TTL de 24 h de propósito
+        if item and isinstance(item.get('data'), dict):
+            return item['data']
     idx, pagina = {}, 1
     while True:
         try:
-            resp = omie_call('/servicos/os/', 'ListarOS', {"pagina": pagina, "registros_por_pagina": 50,
-                                                           "apenas_importado_api": "N"}, timeout=40)
+            resp = _omie_os_pagina(pagina)
         except OmieNoRecords:
             break
-        for o in resp.get('osCadastro') or []:
-            cab = o.get('Cabecalho') or {}
-            n = str(cab.get('cNumOS') or '').strip()
-            if n:
-                idx[n] = {"nCodOS": cab.get('nCodOS'), "cEtapa": cab.get('cEtapa') or ''}
+        _omie_os_absorve(idx, resp)
         if pagina >= int(resp.get('total_de_paginas') or 1):
             break
         pagina += 1
@@ -2197,11 +2209,37 @@ def _omie_os_indice(forcar=False):
     return idx
 
 
+def _omie_os_busca_nova(num, idx):
+    """OS recém-criada no Omie que ainda não está no índice: lê só as páginas mais novas (a 1ª e depois da última
+    para trás) e para assim que achar, em vez de refazer a varredura inteira."""
+    try:
+        resp = _omie_os_pagina(1)
+    except OmieNoRecords:
+        return
+    _omie_os_absorve(idx, resp)
+    total = int(resp.get('total_de_paginas') or 1)
+    pagina = total
+    while num not in idx and pagina > 1:
+        try:
+            _omie_os_absorve(idx, _omie_os_pagina(pagina))
+        except OmieNoRecords:
+            pass
+        pagina -= 1
+    _cache_set('os_indice_numero', idx)
+
+
 def _omie_os_por_numero(num):
+    import time
     num = str(num or '').strip()
     idx = _omie_os_indice()
+    if num in idx:
+        return idx[num]
+    chave = (_cache_fkey('os_miss'), num)
+    if time.time() - _OS_NUM_MISS.get(chave, 0) < 60:
+        return None   # acabou de procurar e não achou: não repete a busca cara
+    _omie_os_busca_nova(num, idx)
     if num not in idx:
-        idx = _omie_os_indice(forcar=True)   # OS recém-criada no Omie
+        _OS_NUM_MISS[chave] = time.time()
     return idx.get(num)
 
 
