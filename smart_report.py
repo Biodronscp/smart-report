@@ -3414,6 +3414,192 @@ def _resumo_laudo(full_data, owner, draft):
     return ''
 
 
+# ---- Resumo do laudo para a bancada: seções curtas + "o que fazer" em poucas palavras ----
+_LAUDO_SEC_RE = re.compile(r'^[ \t]*([1-6])[ \t]*[.)][ \t]+(.{3,160}?)[ \t]*:?[ \t]*$', re.M)
+_NOMINAL_VERBO = {   # substantivo que abre o item da proposta -> verbo (o resto da frase segue)
+    'substituição': 'Substituir', 'substituicao': 'Substituir', 'troca': 'Trocar', 'reposição': 'Repor', 'reposicao': 'Repor',
+    'reparo': 'Reparar', 'recuperação': 'Recuperar', 'recuperacao': 'Recuperar', 'conserto': 'Consertar', 'limpeza': 'Limpar',
+    'higienização': 'Higienizar', 'higienizacao': 'Higienizar', 'calibração': 'Calibrar', 'calibracao': 'Calibrar',
+    'recalibração': 'Recalibrar', 'recalibracao': 'Recalibrar', 'soldagem': 'Soldar', 'ressolda': 'Ressoldar', 'revisão': 'Revisar',
+    'revisao': 'Revisar', 'ajuste': 'Ajustar', 'regulagem': 'Regular', 'teste': 'Testar', 'reaperto': 'Reapertar',
+    'lubrificação': 'Lubrificar', 'lubrificacao': 'Lubrificar', 'atualização': 'Atualizar', 'atualizacao': 'Atualizar',
+    'reprogramação': 'Reprogramar', 'reprogramacao': 'Reprogramar', 'instalação': 'Instalar', 'instalacao': 'Instalar',
+    'remoção': 'Remover', 'remocao': 'Remover', 'vedação': 'Vedar', 'vedacao': 'Vedar', 'balanceamento': 'Balancear',
+    'recarga': 'Recarregar', 'verificação': 'Verificar', 'verificacao': 'Verificar', 'inspeção': 'Inspecionar', 'inspecao': 'Inspecionar',
+    'colagem': 'Colar', 'fixação': 'Fixar', 'fixacao': 'Fixar', 'reinstalação': 'Reinstalar', 'reinstalacao': 'Reinstalar',
+}
+_CORTE_EXPLICACAO = re.compile(
+    r'(?:,|;|:| – | — |\s-\s| devido| para | pois| que | visto| uma vez| conforme| com o objetivo| a fim| em raz[ãa]o|'
+    r' com | garantindo| visando| evitando| permitindo| causad| decorrente| identificad| constatad| apresentad| por conta| já que| onde )',
+    re.I)
+
+
+def _acao_curta(item, limite=60):
+    """'Substituição do conector XT90 danificado, que apresenta sinais de...' -> 'Substituir conector XT90 danificado'."""
+    t = re.sub(r'^[\s\-•*–—\d.)]+', '', str(item or '')).strip()
+    t = re.sub(r'\s+', ' ', t)
+    m = _CORTE_EXPLICACAO.search(t)
+    if m and m.start() >= (20 if m.group(0) == ' com ' else 10):
+        t = t[:m.start()].strip()
+    t = t.strip(' .;:-')
+    if not t:
+        return ''
+    palavras = t.split(' ')
+    primeira = palavras[0].lower()
+    if primeira in _NOMINAL_VERBO and len(palavras) > 2 and palavras[1].lower() == 'e' and palavras[2].lower() in _NOMINAL_VERBO:
+        t = 'Fazer ' + t[0].lower() + t[1:]   # "Limpeza e higienização interna": mantém os dois substantivos
+    elif primeira in _NOMINAL_VERBO:
+        resto = palavras[1:]
+        if resto and resto[0].lower() in ('do', 'da', 'dos', 'das', 'de', 'o', 'a', 'os', 'as'):
+            resto = resto[1:]
+        t = ' '.join([_NOMINAL_VERBO[primeira]] + resto)
+    elif primeira in ('equalização', 'equalizacao'):
+        t = 'Fazer ' + t[0].lower() + t[1:]
+    elif not primeira.endswith(('ar', 'er', 'ir', 'or')):
+        t = 'Fazer ' + t[0].lower() + t[1:]
+    t = t[0].upper() + t[1:]
+    if len(t) > limite:
+        t = t[:limite].rsplit(' ', 1)[0].rstrip(' ,;:-') + '…'
+    return t
+
+
+def _acoes_do_laudo(corpo):
+    """Itens da 'Proposta de Serviço' (linhas com marcador, ou frases) -> lista curta de ações, sem repetição."""
+    linhas = [l.strip() for l in (corpo or '').replace('\r', '').split('\n') if l.strip()]
+    itens, atual = [], ''
+    marcador = re.compile(r'^[-•*–—]|^\d+\s*[.)]|^[a-z]\)')
+    if any(marcador.match(l) for l in linhas):
+        for l in linhas:
+            if marcador.match(l):
+                if atual:
+                    itens.append(atual)
+                atual = l
+            elif atual:
+                atual += ' ' + l
+        if atual:
+            itens.append(atual)
+    else:   # texto corrido: uma frase por item
+        itens = [x for x in re.split(r'(?<=[.;])\s+', ' '.join(linhas)) if x.strip()]
+    out, vistos = [], set()
+    for it in itens:
+        a = _acao_curta(it)
+        if len(a) >= 6 and a.lower() not in vistos:
+            vistos.add(a.lower())
+            out.append(a)
+    return out[:8]
+
+
+def _trecho_curto(texto, n=230):
+    t = re.sub(r'\s+', ' ', re.sub(r'(?m)^\s*[-•*–—]\s*', '', texto or '')).strip()
+    if len(t) <= n:
+        return t
+    corte = t[:n]
+    ponto = max(corte.rfind('. '), corte.rfind('; '))
+    return (corte[:ponto + 1] if ponto > n * 0.3 else corte.rsplit(' ', 1)[0] + '…')
+
+
+def _laudo_resumo_estruturado(txt):
+    """Quebra o laudo (estrutura numerada 1..6 gerada pela IA) em partes fáceis de ler. Texto sem essa estrutura
+    (laudo escrito à mão) devolve só parágrafos curtos. Nunca inventa nada: só recorta o que está no laudo."""
+    txt = (txt or '').replace('\r', '').strip()
+    if not txt:
+        return None
+    seq, esperado = [], 1
+    for m in _LAUDO_SEC_RE.finditer(txt):
+        if int(m.group(1)) == esperado:
+            seq.append(m)
+            esperado += 1
+    partes = []
+    for i, m in enumerate(seq):
+        fim = seq[i + 1].start() if i + 1 < len(seq) else len(txt)
+        titulo = re.sub(r'\s*\(.*?\)\s*', ' ', m.group(2)).strip(' :')
+        partes.append({"n": int(m.group(1)), "titulo": titulo, "texto": txt[m.end():fim].strip()})
+    st = re.search(r'^[ \t]*Status:[ \t]*(.+)$', txt, re.M | re.I)
+    gar = re.search(r'PARECER DE GARANTIA:\s*(APROVADA|NEGADA)', txt, re.I)
+    secoes = [{"n": x['n'], "titulo": x['titulo'], "resumo": _trecho_curto(x['texto'])}
+              for x in partes if x['n'] in (1, 2, 3) and x['texto']]
+    proposta = next((x['texto'] for x in partes if x['n'] == 4), '')
+    if not seq:   # sem estrutura: tenta achar a proposta pelo título, senão sem ações
+        m = re.search(r'Proposta de Servi[çc]o[^\n]*\n(.+?)(?:\n\s*\d\.\s|\Z)', txt, re.S | re.I)
+        proposta = m.group(1) if m else ''
+        paragrafos = [x.strip() for x in re.split(r'\n\s*\n', txt) if x.strip()][:3]
+        secoes = [{"n": 0, "titulo": '', "resumo": _trecho_curto(x)} for x in paragrafos]
+    return {
+        "status": (st.group(1).strip() if st else ''),
+        "garantia": (gar.group(1).upper() if gar else ''),
+        "secoes": secoes,
+        "acoes": _acoes_do_laudo(proposta),
+    }
+
+
+def laudo_ia_valido(ia, texto):
+    """A lista guardada só vale se foi gerada a partir do laudo atual (mesmo hash)."""
+    import hashlib
+    return bool(ia and isinstance(ia.get('lista'), list) and texto and ia.get('hash') == hashlib.md5(texto.encode('utf-8')).hexdigest())
+
+
+def _gemini_lista(prompt):
+    """Chama o Gemini pedindo um array JSON de textos. Devolve (lista, modelo) ou (None, erro)."""
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return None, 'GEMINI_API_KEY não configurada'
+    env_model = os.environ.get('GEMINI_MODEL')
+    erro = ''
+    for modelo in ([env_model] if env_model else ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest']):
+        gen = {"temperature": 0.2, "maxOutputTokens": 600, "responseMimeType": "application/json"}
+        if '2.5' in modelo:
+            gen["thinkingConfig"] = {"thinkingBudget": 0}
+        body = json.dumps({"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}).encode('utf-8')
+        req = urlreq.Request(f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}",
+                             data=body, headers={'Content-Type': 'application/json'})
+        try:
+            with urlreq.urlopen(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            texto = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            texto = re.sub(r'^```(?:json)?|```$', '', texto, flags=re.M).strip()
+            lista = json.loads(texto)
+            if isinstance(lista, list):
+                return [str(x).strip() for x in lista if str(x).strip()], modelo
+            erro = 'resposta fora do formato'
+        except HTTPError as e:
+            erro = f"HTTP {e.code} ({modelo})"
+        except Exception as e:
+            erro = f"{type(e).__name__} ({modelo})"
+    return None, erro
+
+
+@app.route('/api/os/<os_id>/acoes-ia', methods=['POST'])
+def os_acoes_ia(os_id):
+    """Lista bem resumida do que fazer no equipamento, a partir do laudo da OS (IA). Fica guardada na OS e só é
+    refeita se o laudo mudar. Sem IA disponível devolve lista=null e a tela segue com o resumo por regras."""
+    import hashlib
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    owner, draft = _find_filial_draft(full_data, user, os_id)
+    if not draft:
+        return jsonify({"error": "OS não encontrada"}), 404
+    texto = _resumo_laudo(full_data, owner, draft)
+    if not texto:
+        return jsonify({"lista": None, "erro": "sem laudo"})
+    h = hashlib.md5(texto.encode('utf-8')).hexdigest()
+    guardado = draft.get('acoesIA') or {}
+    if guardado.get('hash') == h and isinstance(guardado.get('lista'), list):
+        return jsonify({"lista": guardado['lista'], "cache": True})
+    prompt = ("Você lê o LAUDO TÉCNICO abaixo e lista, de forma MUITO resumida, o que o técnico precisa FAZER no equipamento.\n"
+              "Regras: responda SOMENTE com um array JSON de strings (no máximo 8). Cada string tem de 2 a 6 palavras, começa com verbo "
+              "no infinitivo ou com 'Fazer' (ex.: \"Fazer equalização das células\", \"Substituir conector\", \"Trocar borrachas de vedação\"). "
+              "Use SOMENTE intervenções que constam no laudo (principalmente a Proposta de Serviço). NÃO inclua testes finais, avisos, "
+              "garantia nem justificativas. NÃO invente nada. Se o laudo não indicar o que fazer, responda [].\n\nLAUDO:\n" + texto[:6000])
+    lista, info = _gemini_lista(prompt)
+    if lista is None:
+        return jsonify({"lista": None, "erro": info})
+    lista = [_acao_curta(x, 70) or x for x in lista][:8]
+    draft['acoesIA'] = {"hash": h, "lista": lista, "modelo": info, "em": datetime.utcnow().isoformat() + "Z"}
+    save_data(full_data)
+    return jsonify({"lista": lista})
+
+
 @app.route('/api/pecas/buscar-serial', methods=['GET'])
 def buscar_serial():
     """Rastreabilidade: busca um nº de série de peça (velha ou nova) em TODAS as OS
@@ -3492,6 +3678,9 @@ def os_bancada():
             entry["osId"] = escolha.get('id')
             entry["os"] = _strip_part_photos(escolha)
             entry["resumo"] = _resumo_laudo(full_data, escolha_owner, escolha)
+            entry["laudoRes"] = _laudo_resumo_estruturado(entry["resumo"])
+            if laudo_ia_valido(escolha.get('acoesIA'), entry["resumo"]):
+                entry["acoesIA"] = escolha['acoesIA']['lista']
             pr = _req_pecas_da_os(full_data, user, escolha.get('id'))
             entry["pecasReq"] = pr                                            # por índice da peça na OS
             entry["pecasReqTotal"] = len(pr)
@@ -5987,6 +6176,7 @@ HTML_PAGE = """
             const FASE_PREPARACAO = 10843780552;
             const [execAbertaId, setExecAbertaId] = useState(null);
             const [resumoAberto, setResumoAberto] = useState({});   // "ver laudo completo" por OS
+            const [acoesIA, setAcoesIA] = useState({});             // {osId: [ações curtas do laudo]} (refinadas pela IA)
             const [execOs, setExecOs] = useState(null);
             const [execCarregando, setExecCarregando] = useState(false);
             const [execPecasSalvando, setExecPecasSalvando] = useState(false);
@@ -9796,9 +9986,14 @@ HTML_PAGE = """
                 return { total: s + p, feitos: fs + fp };
             };
 
-            const abrirExec = async (o) => {
+            const abrirExec = async (o, e) => {
                 if (execAbertaId === o.id) { setExecAbertaId(null); setExecOs(null); return; }
                 setExecAbertaId(o.id);
+                if (e && e.resumo && !e.acoesIA && acoesIA[o.id] === undefined) {   // ainda sem a lista da IA: busca sem travar a tela
+                    fetch(`/api/os/${o.id}/acoes-ia`, { method: 'POST', headers: { 'Authorization': auth.token } })
+                        .then(r => r.json()).then(d => { if (d && Array.isArray(d.lista) && d.lista.length) setAcoesIA(prev => ({ ...prev, [o.id]: d.lista })); })
+                        .catch(() => {});
+                }
                 setExecOs(o);                 // mostra na hora a versão da lista (sem fotos)
                 setExecCarregando(true);
                 try {                          // e troca pela completa (com as fotos dos seriais)
@@ -9953,7 +10148,7 @@ HTML_PAGE = """
                     const reprovado = o.execEstado === 'reprovado';
                     return html`
                         <div key=${o.id} className="bg-white rounded-xl shadow-sm border ${reprovado ? 'border-red-300' : (completo ? 'border-emerald-300' : 'border-slate-200')} overflow-hidden">
-                            <button onClick=${() => abrirExec(o)} className="w-full p-4 flex items-center justify-between gap-3 hover:bg-slate-50 text-left">
+                            <button onClick=${() => abrirExec(o, e)} className="w-full p-4 flex items-center justify-between gap-3 hover:bg-slate-50 text-left">
                                 <div className="min-w-0">
                                     <div className="font-semibold text-slate-800 truncate">${e.cliente || (o.client && o.client.name) || 'Sem cliente'}</div>
                                     <div className="text-xs text-slate-500 truncate">
@@ -9982,29 +10177,32 @@ HTML_PAGE = """
                                 <div className="border-t border-slate-200 p-4 space-y-5">
                                     ${execCarregando && html`<div className="text-xs text-slate-400 flex items-center gap-1"><i className="ph ph-spinner animate-spin"></i> carregando fotos…</div>`}
 
-                                    ${(e.resumo || (os.services || []).length || (os.parts || []).length) ? html`
-                                        <div className="bg-amber-50 border border-amber-300 rounded-lg p-3">
-                                            <div className="text-xs font-bold text-amber-800 uppercase mb-2 flex items-center gap-1"><i className="ph-fill ph-clipboard-text"></i> Resumo do que fazer</div>
-                                            ${(os.services || []).length ? html`
-                                                <div className="text-sm text-slate-800 mb-1">
-                                                    <b>Serviços:</b> ${(os.services || []).map(s => `${s.description || s.code || 'serviço'}${s.quantity > 1 ? ` (${s.quantity}x)` : ''}`).join(' · ')}
-                                                </div>` : ''}
-                                            ${(os.parts || []).length ? html`
-                                                <div className="text-sm text-slate-800 mb-1">
-                                                    <b>Peças:</b> ${(os.parts || []).map(p => `${p.description || p.code || 'peça'}${p.quantity > 1 ? ` (${p.quantity}x)` : ''}`).join(' · ')}
-                                                </div>` : ''}
-                                            ${e.resumo ? html`
-                                                <div className="mt-2 pt-2 border-t border-amber-200">
-                                                    <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
-                                                        ${resumoAberto[o.id] || e.resumo.length <= 260 ? e.resumo : e.resumo.slice(0, 260).trim() + '…'}
-                                                    </p>
-                                                    ${e.resumo.length > 260 ? html`
-                                                        <button onClick=${() => setResumoAberto(p => ({ ...p, [o.id]: !p[o.id] }))} className="text-xs font-bold text-amber-800 hover:underline mt-1">
-                                                            ${resumoAberto[o.id] ? 'ver menos' : 'ver laudo completo'}
-                                                        </button>` : ''}
-                                                </div>` : ''}
-                                        </div>
-                                    ` : ''}
+                                    ${(e.resumo || e.laudoRes) ? (() => {
+                                        const lr = e.laudoRes || { secoes: [], acoes: [] };
+                                        const completo = !!resumoAberto[o.id];
+                                        return html`
+                                            <div className="rounded-lg border border-indigo-200 bg-indigo-50/60 p-3">
+                                                <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
+                                                    <div className="text-xs font-bold text-indigo-800 uppercase flex items-center gap-1"><i className="ph-fill ph-clipboard-text"></i> Resumo do laudo</div>
+                                                    <div className="flex gap-1 flex-wrap">
+                                                        ${lr.garantia ? html`<span className=${`text-[11px] font-bold px-2 py-0.5 rounded-full ${lr.garantia === 'APROVADA' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>Garantia ${lr.garantia === 'APROVADA' ? 'aprovada' : 'negada'}</span>` : ''}
+                                                        ${lr.status ? html`<span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-white border border-indigo-200 text-indigo-700">${lr.status}</span>` : ''}
+                                                    </div>
+                                                </div>
+                                                <div className="space-y-2">
+                                                    ${(lr.secoes || []).map(sc => html`
+                                                        <div key=${sc.n + sc.titulo} className="bg-white border border-indigo-100 rounded-lg p-2.5 md:flex md:gap-3">
+                                                            ${sc.titulo ? html`<div className="text-[11px] font-bold text-indigo-700 uppercase mb-1 md:mb-0 md:w-44 md:flex-none">${sc.titulo}</div>` : ''}
+                                                            <p className="text-sm text-slate-700 leading-snug">${sc.resumo}</p>
+                                                        </div>`)}
+                                                </div>
+                                                ${e.resumo ? html`
+                                                    <button onClick=${() => setResumoAberto(p => ({ ...p, [o.id]: !p[o.id] }))} className="text-xs font-bold text-indigo-700 hover:underline mt-2 flex items-center gap-1">
+                                                        <i className=${'ph-bold ' + (completo ? 'ph-caret-up' : 'ph-caret-down')}></i> ${completo ? 'ocultar laudo completo' : 'ver laudo completo'}
+                                                    </button>
+                                                    ${completo ? html`<div className="mt-2 bg-white border border-slate-200 rounded-lg p-3 max-h-80 overflow-auto"><p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">${e.resumo}</p></div>` : ''}` : ''}
+                                            </div>`;
+                                    })() : ''}
 
                                     ${os.execEstado === 'reprovado' && os.execMotivoReprova ? html`
                                         <div className="bg-red-50 border border-red-300 rounded-lg p-3">
@@ -10015,6 +10213,17 @@ HTML_PAGE = """
 
                                     <div>
                                         <h3 className="text-sm font-bold text-slate-700 mb-2 flex items-center gap-1"><i className="ph-fill ph-wrench text-blue-600"></i> Serviços</h3>
+                                        ${(() => {
+                                            const acoes = acoesIA[o.id] || e.acoesIA || (e.laudoRes && e.laudoRes.acoes) || [];
+                                            if (!acoes.length) return '';
+                                            return html`
+                                                <div className="mb-2 rounded-lg border border-blue-200 bg-blue-50 p-3">
+                                                    <div className="text-xs font-bold text-blue-800 uppercase mb-1.5 flex items-center gap-1"><i className="ph-fill ph-list-checks"></i> O que fazer no equipamento <span className="font-normal normal-case text-blue-600/80">(resumo do laudo)</span></div>
+                                                    <ul className="space-y-1">
+                                                        ${acoes.map((a, k) => html`<li key=${k} className="flex items-start gap-2 text-sm text-slate-800"><i className="ph-bold ph-arrow-right text-blue-500 mt-0.5 flex-shrink-0"></i><span>${a}</span></li>`)}
+                                                    </ul>
+                                                </div>`;
+                                        })()}
                                         ${!(os.services || []).length ? html`<p className="text-xs text-slate-400">Nenhum serviço nesta OS.</p>` : html`
                                             <div className="space-y-1">
                                                 ${(os.services || []).map((s, i) => {
