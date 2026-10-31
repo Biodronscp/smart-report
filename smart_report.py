@@ -110,7 +110,7 @@ _API_LIVRE_RESTRITOS = ('/api/painel', '/api/login', '/api/logout', '/api/logo',
 _API_EXTRA_POR_PAPEL = {
     'vendedor': (),
     'expedicao': (),
-    'almoxarife': ('/api/requisicoes', '/api/omie/produtos'),
+    'almoxarife': ('/api/requisicoes', '/api/omie/produtos', '/api/estoque', '/api/omie/estoque'),
 }
 _API_GET_POR_PAPEL = {
     'almoxarife': ('/api/data', '/api/os'),
@@ -3120,6 +3120,171 @@ def _req_pecas_da_os(full_data, user, os_id):
     return out
 
 
+# ==========================================================
+#  CONSUMO INTERNO: requisição do almoxarifado que dá BAIXA no estoque do Omie (movimento de saída)
+#  Escreve no estoque real. Por isso: modo SIMULAÇÃO ligado por padrão (só o administrador liga a baixa real),
+#  local/motivo configuráveis, baixa item a item (erro de um não derruba os outros) e código de integração
+#  único por item (o Omie recusa repetição -> sem baixa em duplicidade).
+# ==========================================================
+CONSUMO_MAX_ITENS = 30
+
+
+def _estoque_cfg(full_data, user):
+    fil = _req_filial(full_data, user)
+    c = ((full_data.get('estoqueConsumoCfg') or {}).get(fil)) or {}
+    return {"codigoLocal": c.get('codigoLocal') or None, "motivo": (c.get('motivo') or '').strip(), "simular": bool(c.get('simular', True))}
+
+
+def _hoje_br():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%d/%m/%Y')
+    except Exception:
+        return (datetime.utcnow() - timedelta(hours=3)).strftime('%d/%m/%Y')
+
+
+@app.route('/api/estoque/config', methods=['GET', 'POST'])
+def estoque_config():
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    if not _req_is_almox(full_data, user):
+        return _sem_permissao()
+    fil = _req_filial(full_data, user)
+    if request.method == 'POST':
+        if (full_data['users'][user].get('role') or 'user') != 'admin':
+            return jsonify({"error": "Só o administrador altera a configuração da baixa de estoque."}), 403
+        b = request.json or {}
+        local = b.get('codigoLocal')
+        try:
+            local = int(local) if str(local or '').strip() else None
+        except (TypeError, ValueError):
+            return jsonify({"error": "Código do local de estoque inválido."}), 400
+        cfgs = full_data.setdefault('estoqueConsumoCfg', {})
+        cfgs[fil] = {"codigoLocal": local, "motivo": _req_txt(b.get('motivo'), 20), "simular": bool(b.get('simular', True))}
+        save_data(full_data)
+    c = _estoque_cfg(full_data, user)
+    return jsonify({**c, "pronto": bool(c['codigoLocal'] and c['motivo']), "admin": (full_data['users'][user].get('role') or 'user') == 'admin'})
+
+
+@app.route('/api/omie/estoque/locais', methods=['GET'])
+def omie_estoque_locais():
+    """Locais de estoque do Omie (para o administrador escolher na configuração). Leitura apenas."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    if not _req_is_almox(full_data, user):
+        return _sem_permissao()
+    try:
+        data = omie_call('/estoque/local/', 'ListarLocaisEstoque', {"nPagina": 1, "nRegPorPagina": 100})
+    except OmieError as e:
+        return jsonify({"items": [], "erro": str(e)})
+    except OmieNoRecords:
+        return jsonify({"items": []})
+    lista = next((v for v in data.values() if isinstance(v, list)), []) if isinstance(data, dict) else []
+    itens = []
+    for l in lista:
+        if not isinstance(l, dict):
+            continue
+        cod = next((l.get(k) for k in ('codigo_local_estoque', 'nCodLocal', 'nCodigo', 'codigo') if l.get(k)), None)
+        desc = next((l.get(k) for k in ('descricao', 'cDescricao', 'nome', 'cNome') if l.get(k)), '')
+        if cod:
+            itens.append({"codigo": cod, "descricao": desc})
+    return jsonify({"items": itens})
+
+
+def _baixar_itens_omie(full_data, user, r, cfg):
+    """Dá baixa (saída) no Omie dos itens que ainda não foram baixados. Atualiza r['itens'][i]['baixa'] e r['status']."""
+    agora = datetime.utcnow().isoformat() + "Z"
+    nome = _responsavel_nome(full_data, r.get('solicitante'))
+    for i, it in enumerate(r['itens']):
+        b = it.get('baixa') or {}
+        if b.get('ok'):
+            continue
+        cod_int = f"{r['numero']}-{i + 1}"
+        if cfg['simular']:
+            it['baixa'] = {"ok": True, "simulada": True, "em": agora, "por": user, "codInt": cod_int}
+            continue
+        param = {
+            "codigo_local_estoque": int(cfg['codigoLocal']), "id_prod": int(it['idProd']), "data": _hoje_br(),
+            "quan": (str(int(it['qtd'])) if float(it['qtd']) == int(it['qtd']) else str(round(float(it['qtd']), 4))),
+            "obs": f"{r.get('observacao') or ''} | Consumo interno {r['numero']} | {nome}"[:250],
+            "origem": "AJU", "tipo": "SAI", "motivo": cfg['motivo'], "cod_int_ajuste": cod_int,
+        }
+        if it.get('valor'):
+            param["valor"] = it['valor']
+        try:
+            resp = omie_call('/estoque/ajuste/', 'IncluirAjusteEstoque', param, timeout=30)
+            cod_status = str((resp or {}).get('cCodStatus', '0'))
+            if cod_status not in ('0', ''):
+                raise OmieError(str((resp or {}).get('cDescStatus') or 'Omie recusou o movimento'), status=502)
+            it['baixa'] = {"ok": True, "simulada": False, "em": agora, "por": user, "codInt": cod_int,
+                           "omie": {k: v for k, v in (resp or {}).items() if k in ('nIdMovest', 'nIdAjuste', 'cCodStatus', 'cDescStatus', 'codigo_ajuste')}}
+        except OmieError as e:
+            msg = str(e)
+            if any(t in msg.lower() for t in ('já existe', 'ja existe', 'duplic', 'cadastrad')):
+                msg += ' — possível baixa já feita: confira o movimento no Omie antes de tentar de novo.'
+            it['baixa'] = {"ok": False, "erro": msg[:300], "em": agora, "codInt": cod_int}
+    feitos = [it for it in r['itens'] if (it.get('baixa') or {}).get('ok')]
+    if len(feitos) == len(r['itens']):
+        r['status'] = 'simulada' if all((it['baixa'].get('simulada')) for it in feitos) else 'baixada'
+    else:
+        r['status'] = 'baixa_parcial'
+    return r
+
+
+def _req_criar_consumo(full_data, user, body):
+    if not _req_is_almox(full_data, user):
+        return _sem_permissao()
+    uid = _req_txt(body.get('uid'), 60)
+    if uid:
+        ja = next((x for x in _req_lista(full_data) if x.get('uid') == uid), None)
+        if ja:
+            return jsonify(_req_view(full_data, ja))   # clique duplicado / reenvio: devolve a mesma requisição
+    obs = _req_txt(body.get('observacao'), 200)
+    if len(obs) < 3:
+        return jsonify({"error": "Preencha a observação (ela vai junto no movimento de estoque do Omie)."}), 400
+    itens = []
+    for it in (body.get('itens') or [])[:CONSUMO_MAX_ITENS]:
+        desc = _req_txt(it.get('descricao'), 200)
+        qtd = _req_num(it.get('qtd'))
+        try:
+            id_prod = int(it.get('idProd'))
+        except (TypeError, ValueError):
+            id_prod = 0
+        if not desc:
+            continue
+        if id_prod <= 0:
+            return jsonify({"error": f"Escolha \"{desc}\" na lista do catálogo do Omie (não vale texto livre)."}), 400
+        if qtd <= 0:
+            return jsonify({"error": f"Quantidade inválida em: {desc}"}), 400
+        valor = _req_num(it.get('valor'))
+        itens.append({"codigo": _req_txt(it.get('codigo'), 60), "descricao": desc, "qtd": qtd,
+                      "unidade": _req_txt(it.get('unidade'), 8) or 'UN', "idProd": id_prod,
+                      "valor": valor if valor > 0 else None, "obs": "", "qtdAtendida": None, "baixa": None})
+    if not itens:
+        return jsonify({"error": "Adicione ao menos um produto"}), 400
+    cfg = _estoque_cfg(full_data, user)
+    if not cfg['simular'] and not (cfg['codigoLocal'] and cfg['motivo']):
+        return jsonify({"error": "A baixa no estoque ainda não foi configurada (local de estoque e motivo). Peça ao administrador.", "configurar": True}), 409
+    full_data['reqSeq'] = int(full_data.get('reqSeq') or 0) + 1
+    now = datetime.utcnow().isoformat() + "Z"
+    r = {
+        "id": "req_" + str(int(datetime.utcnow().timestamp() * 1000)) + "_" + secrets.token_hex(3),
+        "numero": f"REQ-{full_data['reqSeq']:04d}", "tipo": "consumo", "uid": uid,
+        "filialId": _req_filial(full_data, user), "solicitante": user, "criadoEm": now, "atualizadoEm": now,
+        "status": "pendente", "urgencia": "normal", "osId": "", "osRotulo": "Consumo interno", "observacao": obs,
+        "itens": itens, "resposta": "", "retiradoPor": "", "historico": [],
+    }
+    _req_evento(r, user, 'criada')
+    _req_lista(full_data).append(r)
+    save_data(full_data)   # grava ANTES de falar com o Omie: se algo cair no meio, a requisição e os códigos já existem
+    _baixar_itens_omie(full_data, user, r, cfg)
+    _req_evento(r, user, 'baixa_simulada' if r['status'] == 'simulada' else ('baixa_feita' if r['status'] == 'baixada' else 'baixa_parcial'))
+    save_data(full_data)
+    return jsonify(_req_view(full_data, r))
+
+
 @app.route('/api/requisicoes', methods=['GET'])
 def req_listar():
     user, full_data, err = _require_user()
@@ -3139,6 +3304,8 @@ def req_criar():
     if err:
         return err
     body = request.json or {}
+    if body.get('tipo') == 'consumo':
+        return _req_criar_consumo(full_data, user, body)
     itens = []
     for it in (body.get('itens') or [])[:60]:
         desc = _req_txt(it.get('descricao'), 200)
@@ -3219,6 +3386,8 @@ def req_acao(req_id):
     st = r.get('status')
     aberta = st in ('pendente', 'em_separacao')
 
+    if r.get('tipo') == 'consumo' and acao != 'baixar':
+        return jsonify({"error": "Requisição de consumo interno: a baixa de estoque não pode ser desfeita por aqui. Estorne no Omie, se preciso."}), 400
     if acao == 'cancelar':
         if not aberta or not (almox or (r.get('solicitante') == user and st == 'pendente')):
             return jsonify({"error": "Só é possível cancelar enquanto estiver pendente"}), 400
@@ -3246,6 +3415,23 @@ def req_acao(req_id):
         r['resposta'] = _req_txt(body.get('resposta'), 300)
         parcial = any(it['qtdAtendida'] < it['qtd'] for it in r['itens'])
         _req_evento(r, user, 'entregue_parcial' if parcial else 'entregue', r['resposta'])
+    elif acao == 'baixar':
+        if r.get('tipo') != 'consumo' or st != 'baixa_parcial':
+            return jsonify({"error": "Nada pendente para baixar nesta requisição."}), 400
+        valores = body.get('valores') if isinstance(body.get('valores'), dict) else {}
+        for k, v in valores.items():   # permite corrigir o valor de um item que o Omie recusou
+            try:
+                it = r['itens'][int(k)]
+            except (ValueError, IndexError):
+                continue
+            if not (it.get('baixa') or {}).get('ok'):
+                val = _req_num(v)
+                it['valor'] = val if val > 0 else None
+        cfg = _estoque_cfg(full_data, user)
+        if not cfg['simular'] and not (cfg['codigoLocal'] and cfg['motivo']):
+            return jsonify({"error": "A baixa no estoque não está configurada."}), 409
+        _baixar_itens_omie(full_data, user, r, cfg)
+        _req_evento(r, user, 'baixa_simulada' if r['status'] == 'simulada' else ('baixa_feita' if r['status'] == 'baixada' else 'baixa_parcial'))
     elif acao == 'liberar':
         # Libera as peças SELECIONADAS pelo almoxarife: itens = [{idx, qtd}]. Sobrando item, a requisição
         # continua aberta (em separação); liberou tudo -> 'entregue'.
@@ -3306,6 +3492,9 @@ def req_excluir(req_id):
     if err:
         return err
     lista = _req_lista(full_data)
+    alvo = next((x for x in lista if x.get('id') == req_id), None)
+    if alvo and any(((it.get('baixa') or {}).get('ok') and not (it.get('baixa') or {}).get('simulada')) for it in (alvo.get('itens') or [])):
+        return jsonify({"error": "Esta requisição já gerou saída de estoque no Omie e não pode ser excluída. Estorne o movimento no Omie."}), 400
     novo = [x for x in lista if x.get('id') != req_id]
     if len(novo) == len(lista):
         return jsonify({"error": "Requisição não encontrada"}), 404
@@ -6129,6 +6318,11 @@ HTML_PAGE = """
             const [reqFiltro, setReqFiltro] = useState('abertas');  // abertas | concluidas | todas
             const [reqTexto, setReqTexto] = useState('');
             const [reqForm, setReqForm] = useState(null);           // null = formulário fechado
+            const [estoqueCfg, setEstoqueCfg] = useState(null);     // {codigoLocal, motivo, simular, pronto, admin} da baixa de estoque
+            const [cfgEdit, setCfgEdit] = useState({ codigoLocal: '', motivo: '', simular: true });
+            const [locaisOmie, setLocaisOmie] = useState(null);
+            const [consumoEnviando, setConsumoEnviando] = useState(false);
+            const [reqValores, setReqValores] = useState({});        // {reqId_idx: valor} para corrigir item recusado pelo Omie
             const [reqBusca, setReqBusca] = useState({ idx: null, q: '', results: [], msg: '' });
             const [reqSaving, setReqSaving] = useState(false);
             const [reqEntrega, setReqEntrega] = useState(null);     // {id, sel:[bool], qtds:[], retiradoPor, resposta}
@@ -6527,6 +6721,62 @@ HTML_PAGE = """
             };
             const reqItemVazio = () => ({ codigo: '', descricao: '', qtd: 1, unidade: 'UN', obs: '' });
             const reqNovo = () => setReqForm({ osId: '', osRotulo: '', urgencia: 'normal', observacao: '', itens: [reqItemVazio()] });
+            // ---- Consumo interno: requisição que dá baixa (saída) no estoque do Omie ----
+            const carregarEstoqueCfg = async () => {
+                try {
+                    const d = await fetch('/api/estoque/config', { headers: { 'Authorization': auth.token } }).then(r => r.json());
+                    if (d && !d.error) { setEstoqueCfg(d); setCfgEdit({ codigoLocal: d.codigoLocal || '', motivo: d.motivo || '', simular: !!d.simular }); }
+                } catch (e) {}
+            };
+            const reqNovoConsumo = () => {
+                setReqForm({ tipo: 'consumo', uid: 'c_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8), observacao: '', itens: [{ ...reqItemVazio(), idProd: null, valor: '' }] });
+                carregarEstoqueCfg();
+            };
+            const salvarEstoqueCfg = async () => {
+                try {
+                    const r = await fetch('/api/estoque/config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth.token }, body: JSON.stringify(cfgEdit) });
+                    const d = await r.json();
+                    if (!r.ok) { alert(d.error || 'Erro ao salvar'); return; }
+                    setEstoqueCfg(d);
+                    alert(d.simular ? 'Configuração salva. A baixa continua em SIMULAÇÃO (nada é baixado no Omie).' : 'Configuração salva. A baixa REAL no estoque do Omie está LIGADA.');
+                } catch (e) { alert('Erro de conexão'); }
+            };
+            const buscarLocaisOmie = async () => {
+                try {
+                    const d = await fetch('/api/omie/estoque/locais', { headers: { 'Authorization': auth.token } }).then(r => r.json());
+                    setLocaisOmie(d.items || []);
+                    if (d.erro) alert('Não consegui listar os locais no Omie: ' + d.erro + '\\n\\nVocê pode digitar o código do local à mão.');
+                } catch (e) { alert('Erro de conexão'); }
+            };
+            const consumoEnviar = async () => {
+                const itens = reqForm.itens.filter(it => (it.descricao || '').trim());
+                if (!itens.length) { alert('Adicione ao menos um produto.'); return; }
+                if (itens.some(it => !it.idProd)) { alert('Escolha cada produto na lista do catálogo do Omie: digite o nome e clique na sugestão.'); return; }
+                if (itens.some(it => !(Number(String(it.qtd).replace(',', '.')) > 0))) { alert('Informe a quantidade de cada produto.'); return; }
+                const obs = (reqForm.observacao || '').trim();
+                if (obs.length < 3) { alert('Preencha a observação: ela vai junto no movimento de estoque do Omie.'); return; }
+                const sim = !!(estoqueCfg && estoqueCfg.simular);
+                const resumo = itens.map(it => '• ' + it.qtd + ' ' + it.unidade + ' — ' + it.descricao).join('\\n');
+                const cab = sim ? 'SIMULAÇÃO: nada será baixado no Omie.\\n\\n' : 'Dar BAIXA no estoque do Omie?\\n\\nIsso gera uma SAÍDA de estoque de verdade e não dá para desfazer pelo Smart.\\n\\n';
+                if (!confirm(cab + resumo + '\\n\\nObservação: ' + obs)) return;
+                setConsumoEnviando(true);
+                try {
+                    const r = await fetch('/api/requisicoes', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ tipo: 'consumo', uid: reqForm.uid, observacao: obs, itens })
+                    });
+                    const d = await r.json();
+                    if (!r.ok) { alert(d.error || 'Erro ao registrar o consumo'); return; }
+                    setReqForm(null);
+                    setReqBusca({ idx: null, q: '', results: [], msg: '' });
+                    setReqFiltro('todas');
+                    fetchRequisicoes();
+                    alert(d.status === 'baixada' ? 'Baixa feita no estoque do Omie (' + d.numero + ').'
+                        : d.status === 'simulada' ? 'Simulação registrada (' + d.numero + '): nada foi baixado no Omie.'
+                        : 'Atenção: ' + d.numero + ' ficou com itens SEM baixa. Veja o motivo em cada item e tente de novo.');
+                } catch (e) { alert('Erro de conexão'); }
+                finally { setConsumoEnviando(false); }
+            };
             const reqSetItem = (i, patch) => setReqForm(f => ({ ...f, itens: f.itens.map((it, k) => k === i ? { ...it, ...patch } : it) }));
             const reqAddItem = () => setReqForm(f => ({ ...f, itens: [...f.itens, reqItemVazio()] }));
             const reqDelItem = (i) => setReqForm(f => ({ ...f, itens: f.itens.length > 1 ? f.itens.filter((_, k) => k !== i) : f.itens }));
@@ -8672,11 +8922,14 @@ HTML_PAGE = """
                     em_separacao: { t: 'Em separação',  c: 'bg-blue-100 text-blue-800 border-blue-300' },
                     entregue:     { t: 'Entregue',      c: 'bg-emerald-100 text-emerald-800 border-emerald-300' },
                     recusada:     { t: 'Recusada',      c: 'bg-red-100 text-red-800 border-red-300' },
-                    cancelada:    { t: 'Cancelada',     c: 'bg-slate-200 text-slate-600 border-slate-300' }
+                    cancelada:    { t: 'Cancelada',     c: 'bg-slate-200 text-slate-600 border-slate-300' },
+                    baixada:      { t: 'Baixa feita no Omie', c: 'bg-emerald-100 text-emerald-800 border-emerald-300' },
+                    baixa_parcial: { t: 'Baixa pendente', c: 'bg-red-100 text-red-800 border-red-300' },
+                    simulada:     { t: 'Simulação (não baixou)', c: 'bg-purple-100 text-purple-800 border-purple-300' }
                 };
-                const ACAO_TXT = { criada: 'criou', em_separacao: 'iniciou a separação', entregue: 'entregou', entregue_parcial: 'entregou parcialmente', liberada: 'liberou as peças', liberada_parcial: 'liberou parte das peças', recusada: 'recusou', cancelada: 'cancelou', reaberta: 'reabriu' };
+                const ACAO_TXT = { criada: 'criou', em_separacao: 'iniciou a separação', entregue: 'entregou', entregue_parcial: 'entregou parcialmente', liberada: 'liberou as peças', liberada_parcial: 'liberou parte das peças', recusada: 'recusou', cancelada: 'cancelou', reaberta: 'reabriu', baixa_feita: 'deu baixa no estoque do Omie', baixa_simulada: 'simulou a baixa (nada foi baixado)', baixa_parcial: 'tentou a baixa (há itens pendentes)' };
                 const todas = requisicoes || [];
-                const abertaSt = (r) => r.status === 'pendente' || r.status === 'em_separacao';
+                const abertaSt = (r) => r.status === 'pendente' || r.status === 'em_separacao' || r.status === 'baixa_parcial';
                 const qtdAbertas = todas.filter(abertaSt).length;
                 const qtdConcl = todas.length - qtdAbertas;
                 const termo = (reqTexto || '').trim().toLowerCase();
@@ -8692,6 +8945,74 @@ HTML_PAGE = """
                     const ref = o.omieOsNumber ? ('OS ' + o.omieOsNumber) : 'Rascunho';
                     return { id: o.id, rotulo: ref + ' — ' + ((o.client && o.client.name) || 'sem cliente') };
                 });
+
+                const renderFormConsumo = () => {
+                    const cfg = estoqueCfg;
+                    return html`
+                    <div className="bg-white p-5 rounded-xl shadow-sm border-2 border-indigo-300 space-y-4">
+                        <div className="flex items-center justify-between">
+                            <h3 className="font-semibold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-warehouse text-indigo-500 text-xl"></i> Consumo interno — baixa no estoque do Omie</h3>
+                            <button onClick=${() => { setReqForm(null); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }} className="text-slate-400 hover:text-slate-600"><i className="ph-bold ph-x"></i></button>
+                        </div>
+                        ${cfg && cfg.simular ? html`<div className="text-xs bg-purple-50 border border-purple-200 text-purple-800 rounded-lg p-2"><b>Modo simulação:</b> o registro é feito aqui, mas <b>nada é baixado</b> no estoque do Omie. O administrador liga a baixa real na configuração abaixo.</div>` : ''}
+                        ${cfg && !cfg.simular && !cfg.pronto ? html`<div className="text-xs bg-red-50 border border-red-200 text-red-700 rounded-lg p-2"><b>Baixa real ainda não configurada</b> (falta o local de estoque ou o motivo). Peça ao administrador.</div>` : ''}
+                        ${cfg && !cfg.simular && cfg.pronto ? html`<div className="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg p-2"><b>Baixa real ligada:</b> ao confirmar, é gerada uma <b>saída</b> no estoque do Omie para cada produto.</div>` : ''}
+                        <div className="space-y-2">
+                            <div className="text-xs font-semibold text-slate-600">Produtos consumidos</div>
+                            ${reqForm.itens.map((it, i) => html`
+                                <div key=${i} className="grid grid-cols-12 gap-2 items-start bg-slate-50 border border-slate-200 rounded-lg p-2">
+                                    <div className="col-span-12 md:col-span-6 relative">
+                                        <input value=${it.descricao} placeholder="Digite o nome ou código e escolha o produto na lista"
+                                            onInput=${e => { const v = e.target.value; reqSetItem(i, { descricao: v, codigo: '', idProd: null }); setReqBusca({ idx: i, q: v, results: [], msg: '' }); }}
+                                            className="w-full p-2 border border-slate-300 rounded text-sm bg-white outline-none focus:ring-2 focus:ring-indigo-400" />
+                                        ${it.idProd ? html`<div className="text-[11px] text-emerald-700 mt-0.5"><i className="ph-fill ph-check-circle"></i> Produto do Omie · código ${it.codigo}</div>`
+                                            : (it.descricao ? html`<div className="text-[11px] text-amber-600 mt-0.5">Clique na sugestão para escolher o produto do Omie.</div>` : '')}
+                                        ${reqBusca.idx === i && (reqBusca.results.length > 0 || reqBusca.msg) && html`
+                                            <div className="absolute z-20 left-0 right-0 mt-1 bg-white border border-slate-300 rounded-lg shadow-lg max-h-56 overflow-auto">
+                                                ${reqBusca.msg && html`<div className="p-2 text-xs text-slate-500">${reqBusca.msg.startsWith('Nada') ? 'Nada no catálogo do Omie.' : reqBusca.msg}</div>`}
+                                                ${reqBusca.results.map((p, k) => html`
+                                                    <button key=${k} type="button" onClick=${() => { reqSetItem(i, { codigo: p.code || '', descricao: p.description || '', unidade: p.unit || it.unidade, idProd: p.id }); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }}
+                                                        className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 border-b border-slate-100 last:border-0">
+                                                        <span className="font-mono text-xs text-slate-500">${p.code}</span> ${p.description}
+                                                    </button>`)}
+                                            </div>`}
+                                    </div>
+                                    <div className="col-span-4 md:col-span-2"><input type="text" inputMode="decimal" value=${it.qtd} onInput=${e => reqSetItem(i, { qtd: e.target.value })} placeholder="Qtd" className="w-full p-2 border border-slate-300 rounded text-sm bg-white text-center" /></div>
+                                    <div className="col-span-6 md:col-span-3"><input type="text" inputMode="decimal" value=${it.valor} onInput=${e => reqSetItem(i, { valor: e.target.value })} placeholder="Valor unit. (se custo zerado)" title="O Omie usa o custo médio do produto. Preencha só se o custo estiver zerado." className="w-full p-2 border border-slate-300 rounded text-sm bg-white" /></div>
+                                    <div className="col-span-2 md:col-span-1 text-right"><button onClick=${() => reqDelItem(i)} disabled=${reqForm.itens.length <= 1} className="p-2 text-red-500 hover:text-red-700 disabled:opacity-30" title="Remover produto"><i className="ph-bold ph-trash"></i></button></div>
+                                </div>`)}
+                            <button onClick=${() => setReqForm(f => ({ ...f, itens: [...f.itens, { ...reqItemVazio(), idProd: null, valor: '' }] }))} className="text-indigo-600 hover:text-indigo-700 text-sm font-medium flex items-center gap-1"><i className="ph-bold ph-plus-circle"></i> Adicionar outro produto</button>
+                        </div>
+                        <label className="block text-xs font-medium text-slate-600">Observação <span className="text-red-500">(obrigatória — vai no movimento de estoque do Omie)</span>
+                            <textarea value=${reqForm.observacao} onInput=${e => setReqForm({ ...reqForm, observacao: e.target.value })} rows="2" className="mt-1 w-full p-2 border border-slate-300 rounded text-sm bg-white" placeholder="Ex.: Consumo interno — material de limpeza da bancada"></textarea>
+                        </label>
+                        <div className="flex justify-end gap-2">
+                            <button onClick=${() => { setReqForm(null); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }} className="px-4 py-2 rounded-lg text-sm text-slate-600 hover:bg-slate-100">Cancelar</button>
+                            <button onClick=${consumoEnviar} disabled=${consumoEnviando} className="px-5 py-2 rounded-lg text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 flex items-center gap-2"><i className="ph-bold ph-arrow-line-down"></i> ${consumoEnviando ? 'Dando baixa…' : (cfg && cfg.simular ? 'Registrar (simulação)' : 'Dar baixa no estoque')}</button>
+                        </div>
+                        ${cfg && cfg.admin ? html`
+                            <details className="border-t border-slate-200 pt-3">
+                                <summary className="text-xs font-semibold text-slate-600 cursor-pointer">Configuração da baixa (administrador)</summary>
+                                <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs text-slate-600">
+                                    <label>Local de estoque (código no Omie)
+                                        <div className="flex gap-1 mt-1">
+                                            <input value=${cfgEdit.codigoLocal} onInput=${e => setCfgEdit({ ...cfgEdit, codigoLocal: e.target.value })} className="w-full p-2 border border-slate-300 rounded text-sm bg-white font-mono" placeholder="ex.: 740798" />
+                                            <button onClick=${buscarLocaisOmie} type="button" className="px-2 border border-slate-300 rounded bg-white hover:bg-slate-50 whitespace-nowrap">Buscar</button>
+                                        </div>
+                                        ${locaisOmie && locaisOmie.length ? html`<select onChange=${e => setCfgEdit({ ...cfgEdit, codigoLocal: e.target.value })} className="mt-1 w-full p-2 border border-slate-300 rounded text-sm bg-white"><option value="">Escolha…</option>${locaisOmie.map(l => html`<option key=${l.codigo} value=${l.codigo}>${l.descricao || 'Local'} (${l.codigo})</option>`)}</select>` : ''}
+                                    </label>
+                                    <label>Motivo do movimento (como no Omie)
+                                        <input value=${cfgEdit.motivo} onInput=${e => setCfgEdit({ ...cfgEdit, motivo: e.target.value })} className="mt-1 w-full p-2 border border-slate-300 rounded text-sm bg-white font-mono" placeholder="código do motivo" />
+                                    </label>
+                                    <label className="flex items-start gap-2 mt-5 cursor-pointer text-sm">
+                                        <input type="checkbox" checked=${cfgEdit.simular} onChange=${e => setCfgEdit({ ...cfgEdit, simular: e.target.checked })} className="mt-0.5 h-4 w-4 accent-purple-600" />
+                                        <span><b>Modo simulação</b> — registra sem baixar no Omie. Desmarque só depois de testar com um produto.</span>
+                                    </label>
+                                </div>
+                                <div className="mt-3 text-right"><button onClick=${salvarEstoqueCfg} className="px-4 py-1.5 text-sm font-bold text-white bg-slate-700 hover:bg-slate-800 rounded">Salvar configuração</button></div>
+                            </details>` : ''}
+                    </div>`;
+                };
 
                 const renderForm = () => html`
                     <div className="bg-white p-5 rounded-xl shadow-sm border-2 border-orange-300 space-y-4">
@@ -8751,13 +9072,15 @@ HTML_PAGE = """
                     const st = ST[r.status] || ST.pendente;
                     const meu = r.solicitante === auth.username;
                     const emEntrega = reqEntrega && reqEntrega.id === r.id;
-                    const aberta = abertaSt(r);
+                    const consumo = r.tipo === 'consumo';
+                    const aberta = abertaSt(r) && !consumo;   // consumo não tem separação/entrega/cancelamento
                     return html`
                         <div key=${r.id} className=${`bg-white rounded-xl shadow-sm border p-4 ${r.urgencia === 'urgente' && aberta ? 'border-red-300' : 'border-slate-200'}`}>
                             <div className="flex flex-wrap items-center gap-2 justify-between">
                                 <div className="flex flex-wrap items-center gap-2">
                                     <span className="font-mono font-bold text-slate-800">${r.numero}</span>
                                     <span className=${`text-xs font-bold px-2 py-0.5 rounded-full border ${st.c}`}>${st.t}</span>
+                                    ${consumo ? html`<span className="text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700"><i className="ph-fill ph-warehouse"></i> Consumo interno</span>` : ''}
                                     ${r.urgencia === 'urgente' && html`<span className="text-xs font-bold px-2 py-0.5 rounded-full bg-red-500 text-white"><i className="ph-fill ph-warning"></i> URGENTE</span>`}
                                 </div>
                                 <div className="text-xs text-slate-500">${r.solicitanteNome}${meu ? ' (você)' : ''} · ${reqData(r.criadoEm)}</div>
@@ -8777,6 +9100,10 @@ HTML_PAGE = """
                                             <span className="font-mono text-xs text-slate-400">${it.codigo}</span> ${it.descricao}
                                             ${it.liberado ? html`<span className="ml-1 text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">liberada</span>` : ''}
                                             ${it.obs && html`<div className="text-xs text-slate-500">${it.obs}</div>`}
+                                            ${consumo && it.baixa && it.baixa.ok ? html`<div className="text-xs text-emerald-700"><i className="ph-fill ph-check-circle"></i> ${it.baixa.simulada ? 'simulado (não baixou no Omie)' : 'baixa feita no Omie'}</div>` : ''}
+                                            ${consumo && it.baixa && !it.baixa.ok ? html`
+                                                <div className="text-xs text-red-600 mt-0.5"><i className="ph-fill ph-warning-circle"></i> ${it.baixa.erro}</div>
+                                                ${reqAlmox ? html`<input type="text" inputMode="decimal" value=${reqValores[r.id + '_' + k] !== undefined ? reqValores[r.id + '_' + k] : (it.valor || '')} onInput=${e => setReqValores(v => ({ ...v, [r.id + '_' + k]: e.target.value }))} placeholder="Valor unit. (se o Omie pediu)" className="mt-1 w-48 p-1 border border-slate-300 rounded text-xs bg-white" />` : ''}` : ''}
                                         </div>
                                         <div className="whitespace-nowrap text-right font-medium">
                                             ${it.qtdAtendida !== null && it.qtdAtendida !== undefined
@@ -8815,11 +9142,12 @@ HTML_PAGE = """
                                 </div>
                                 <div className="flex flex-wrap gap-2">
                                     <button onClick=${() => reqImprimir(r)} className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded flex items-center gap-1"><i className="ph-bold ph-printer"></i> Imprimir</button>
+                                    ${consumo && reqAlmox && r.status === 'baixa_parcial' ? html`<button onClick=${async () => { const valores = {}; r.itens.forEach((it, k) => { const v = reqValores[r.id + '_' + k]; if (v !== undefined && v !== '') valores[k] = v; }); if (await reqAcao(r, 'baixar', { valores })) setReqValores({}); }} className="px-3 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded flex items-center gap-1"><i className="ph-bold ph-arrow-clockwise"></i> Tentar baixar de novo</button>` : ''}
                                     ${reqAlmox && r.status === 'pendente' && html`<button onClick=${() => reqAcao(r, 'separar')} className="px-3 py-1.5 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded flex items-center gap-1"><i className="ph-bold ph-hand-grabbing"></i> Iniciar separação</button>`}
                                     ${reqAlmox && aberta && !emEntrega && html`<button onClick=${() => setReqEntrega({ id: r.id, sel: r.itens.map(it => !it.liberado), qtds: r.itens.map(it => String(it.qtd)), retiradoPor: '', resposta: '' })} className="px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded flex items-center gap-1"><i className="ph-bold ph-package"></i> Liberar peças</button>`}
                                     ${reqAlmox && aberta && html`<button onClick=${() => reqRecusar(r)} className="px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded">Recusar</button>`}
                                     ${aberta && (reqAlmox || (meu && r.status === 'pendente')) && html`<button onClick=${() => reqCancelar(r)} className="px-3 py-1.5 text-xs font-medium text-slate-500 hover:bg-slate-100 rounded">Cancelar</button>`}
-                                    ${reqAlmox && !aberta && html`<button onClick=${() => reqAcao(r, 'reabrir')} className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 rounded">Reabrir</button>`}
+                                    ${reqAlmox && !aberta && !consumo && html`<button onClick=${() => reqAcao(r, 'reabrir')} className="px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 rounded">Reabrir</button>`}
                                     ${auth.role === 'admin' && html`<button onClick=${() => reqExcluir(r)} className="px-2 py-1.5 text-xs text-red-400 hover:text-red-600" title="Excluir definitivamente (admin)"><i className="ph-bold ph-trash"></i></button>`}
                                 </div>
                             </div>
@@ -8838,12 +9166,13 @@ HTML_PAGE = """
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <button onClick=${fetchRequisicoes} disabled=${reqLoading} className="text-slate-500 hover:text-slate-700 text-sm flex items-center gap-1 disabled:opacity-50"><i className=${'ph-bold ph-arrows-clockwise' + (reqLoading ? ' animate-spin' : '')}></i></button>
+                                    ${!reqForm && reqAlmox && html`<button onClick=${reqNovoConsumo} className="px-4 py-2 rounded-lg text-sm font-bold text-indigo-700 bg-white border border-indigo-300 hover:bg-indigo-50 flex items-center gap-2" title="Dá baixa no estoque do Omie (saída) dos produtos usados internamente"><i className="ph-bold ph-warehouse"></i> Consumo interno</button>`}
                                     ${!reqForm && html`<button onClick=${reqNovo} className="px-4 py-2 rounded-lg text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 flex items-center gap-2 shadow"><i className="ph-bold ph-plus"></i> Nova requisição</button>`}
                                 </div>
                             </div>
                         </div>
 
-                        ${reqForm && renderForm()}
+                        ${reqForm && (reqForm.tipo === 'consumo' ? renderFormConsumo() : renderForm())}
 
                         <div className="flex flex-wrap items-center gap-2">
                             ${chip('abertas', 'Em aberto', qtdAbertas)}
