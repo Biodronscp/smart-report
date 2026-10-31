@@ -3182,28 +3182,6 @@ def estoque_config():
     return jsonify({**c, "pronto": bool(c['codigoLocal'] and c['motivo']), "admin": (full_data['users'][user].get('role') or 'user') == 'admin'})
 
 
-@app.route('/api/admin/omie-leitura', methods=['POST'])
-def admin_omie_leitura():
-    """TEMPORÁRIO / diagnóstico (administrador): chama um método de LEITURA do Omie em /estoque/ e devolve a resposta crua,
-    para descobrir códigos (local, motivo) sem chutar. Só aceita Listar*/Consultar*/Obter* — nunca escreve no Omie."""
-    user, full_data, err = _require_admin()
-    if err:
-        return err
-    b = request.json or {}
-    endpoint = str(b.get('endpoint') or '')
-    call = str(b.get('call') or '')
-    if not endpoint.startswith('/estoque/') or '..' in endpoint or not re.match(r'^(Listar|Consultar|Obter)[A-Za-z]*$', call):
-        return jsonify({"error": "Só métodos de leitura (Listar/Consultar/Obter) em /estoque/."}), 400
-    try:
-        resp = omie_call(endpoint, call, b.get('param') if isinstance(b.get('param'), dict) else {}, timeout=40)
-    except OmieNoRecords:
-        return jsonify({"vazio": True})
-    except OmieError as e:
-        return jsonify({"erro": str(e)}), 200
-    txt = json.dumps(resp, ensure_ascii=False)
-    return jsonify({"tamanho": len(txt), "resposta": resp if len(txt) <= 200000 else None, "cortado": len(txt) > 200000})
-
-
 @app.route('/api/omie/estoque/locais', methods=['GET'])
 def omie_estoque_locais():
     """Locais de estoque do Omie (para o administrador escolher na configuração). Leitura apenas."""
