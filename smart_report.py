@@ -1622,8 +1622,10 @@ def get_categoria_pedido_venda_code(nome=None):
 
 
 def _omie_produtos_all():
-    """Lista de produtos do Omie (cacheada por filial): [{id, code, description, unit, unitPrice}]."""
-    cache_key = "produtos_full"
+    """Lista de produtos do Omie (cacheada por filial): [{id, code, description, unit, unitPrice, inativo}].
+    Traz TAMBÉM os inativos (marcados): quem busca peça para escolher usa _omie_produtos_ativos(); o nome de uma peça que
+    já está numa OS continua resolvendo pelo id mesmo se o produto foi inativado depois."""
+    cache_key = "produtos_v2"   # v2: itens com o campo 'inativo' (o cache antigo não tinha)
     all_items = _cache_get(cache_key)
     if all_items is None:
         all_items = []
@@ -1645,7 +1647,8 @@ def _omie_produtos_all():
                     "code": p.get('codigo') or '',
                     "description": p.get('descricao') or '',
                     "unit": p.get('unidade'),
-                    "unitPrice": float(p.get('valor_unitario') or 0)
+                    "unitPrice": float(p.get('valor_unitario') or 0),
+                    "inativo": str(p.get('inativo') or 'N').strip().upper() == 'S',
                 })
             total_pages = data.get('total_de_paginas', 1) or 1
             if page >= total_pages:
@@ -1653,6 +1656,11 @@ def _omie_produtos_all():
             page += 1
         _cache_set(cache_key, all_items)
     return all_items
+
+
+def _omie_produtos_ativos():
+    """Só os produtos ATIVOS no Omie: é o que aparece na busca de peças (OS e requisições)."""
+    return [p for p in _omie_produtos_all() if not p.get('inativo')]
 
 
 def _enriquece_pecas_omie(parts):
@@ -2641,17 +2649,24 @@ def omie_produtos():
     q = (request.args.get('q') or '').strip()
 
     try:
-        all_items = _omie_produtos_all()
+        # Produtos inativos no Omie não entram na busca. Só o administrador, com ?inativos=1, vê todos (diagnóstico).
+        ver_inativos = request.args.get('inativos') == '1' and (full_data['users'][user].get('role') or 'user') == 'admin'
+        todos = _omie_produtos_all()
+        all_items = todos if ver_inativos else [p for p in todos if not p.get('inativo')]
 
         if q:
             filtered = [p for p in all_items if _matches_wildcard(p['description'], q) or _matches_wildcard(p['code'] or '', q)]
         else:
             filtered = all_items
-        return jsonify({
+        resp = {
             "items": filtered[:50],
             "totalFound": len(filtered),
             "cached": True
-        })
+        }
+        if ver_inativos:
+            resp["totalInativos"] = sum(1 for p in todos if p.get('inativo'))
+            resp["totalCatalogo"] = len(todos)
+        return jsonify(resp)
     except OmieError as e:
         return jsonify({"error": str(e)}), e.status
 
