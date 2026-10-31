@@ -3230,6 +3230,61 @@ def omie_estoque_locais():
     return jsonify({"items": itens})
 
 
+_POS_ESTOQUE_CACHE = {}   # filial -> (instante, {(nCodProd, local): {...}})
+
+
+def _pos_estoque_mapa(full_data, user, forcar=False):
+    """Posição de estoque do Omie (saldo e custo médio por produto/local), em cache de 10 min por filial.
+    É de onde vem o 'valor' da saída: o mesmo custo médio (CMC) que a tela de movimento do Omie preenche sozinha."""
+    import time
+    fil = _req_filial(full_data, user)
+    hit = _POS_ESTOQUE_CACHE.get(fil)
+    if hit and not forcar and time.time() - hit[0] < 600:
+        return hit[1]
+    mapa, pag = {}, 1
+    while pag <= 30:
+        try:
+            r = omie_call('/estoque/consulta/', 'ListarPosEstoque',
+                          {"nPagina": pag, "nRegPorPagina": 100, "dDataPosicao": _hoje_br()}, timeout=40)
+        except OmieNoRecords:
+            break
+        for x in r.get('produtos') or []:
+            mapa[(x.get('nCodProd'), x.get('codigo_local_estoque'))] = {
+                "cmc": float(x.get('nCMC') or 0), "saldo": float(x.get('nSaldo') or 0), "preco": float(x.get('nPrecoUnitario') or 0)}
+        if pag >= int(r.get('nTotPaginas') or 1):
+            break
+        pag += 1
+    _POS_ESTOQUE_CACHE[fil] = (time.time(), mapa)
+    return mapa
+
+
+def _valor_omie(full_data, user, id_prod):
+    """{'valor': custo médio >0 ou None, 'saldo': n} do produto no local da baixa; None se não deu para consultar o Omie."""
+    cfg = _estoque_cfg(full_data, user)
+    try:
+        mapa = _pos_estoque_mapa(full_data, user)
+    except OmieError:
+        return None
+    x = mapa.get((id_prod, cfg['codigoLocal'])) or next((v for (pid, _loc), v in mapa.items() if pid == id_prod), None)
+    if x is None:
+        return {"valor": None, "saldo": 0.0}
+    return {"valor": (x['cmc'] if x['cmc'] > 0 else None), "saldo": x['saldo']}
+
+
+@app.route('/api/estoque/valor/<int:id_prod>', methods=['GET'])
+def estoque_valor(id_prod):
+    """Valor (custo médio) e saldo do produto no Omie, para preencher o consumo interno. valor=null: não tem valor no Omie."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    if not _req_is_almox(full_data, user):
+        return _sem_permissao()
+    v = _valor_omie(full_data, user, id_prod)
+    if v is None:
+        return jsonify({"valor": None, "saldo": None, "erro": "Não consegui consultar o Omie agora."})
+    return jsonify(v)
+
+
 def _baixar_itens_omie(full_data, user, r, cfg):
     """Dá baixa (saída) no Omie dos itens que ainda não foram baixados. Atualiza r['itens'][i]['baixa'] e r['status']."""
     agora = datetime.utcnow().isoformat() + "Z"
@@ -3295,10 +3350,19 @@ def _req_criar_consumo(full_data, user, body):
             return jsonify({"error": f"Escolha \"{desc}\" na lista do catálogo do Omie (não vale texto livre)."}), 400
         if qtd <= 0:
             return jsonify({"error": f"Quantidade inválida em: {desc}"}), 400
-        valor = _req_num(it.get('valor'))
+        digitado = _req_num(it.get('valor'))
+        omie = _valor_omie(full_data, user, id_prod)   # custo médio registrado no Omie (None = Omie fora do ar)
+        if omie and omie['valor']:
+            valor, origem = omie['valor'], 'omie'            # sempre o valor do Omie, o digitado é ignorado
+        elif digitado > 0:
+            valor, origem = digitado, 'manual'               # o item não tem valor no Omie: vale o que foi preenchido
+        elif omie is None:
+            valor, origem = None, ''                         # não deu para consultar: deixa o Omie decidir
+        else:
+            return jsonify({"error": f"O produto \"{desc}\" não tem valor registrado no Omie. Informe o valor unitário."}), 400
         itens.append({"codigo": _req_txt(it.get('codigo'), 60), "descricao": desc, "qtd": qtd,
                       "unidade": _req_txt(it.get('unidade'), 8) or 'UN', "idProd": id_prod,
-                      "valor": valor if valor > 0 else None, "obs": "", "qtdAtendida": None, "baixa": None})
+                      "valor": valor, "valorOrigem": origem, "obs": "", "qtdAtendida": None, "baixa": None})
     if not itens:
         return jsonify({"error": "Adicione ao menos um produto"}), 400
     cfg = _estoque_cfg(full_data, user)
@@ -3461,9 +3525,10 @@ def req_acao(req_id):
                 it = r['itens'][int(k)]
             except (ValueError, IndexError):
                 continue
-            if not (it.get('baixa') or {}).get('ok'):
+            if not (it.get('baixa') or {}).get('ok') and it.get('valorOrigem') != 'omie':
                 val = _req_num(v)
                 it['valor'] = val if val > 0 else None
+                it['valorOrigem'] = 'manual' if val > 0 else ''
         cfg = _estoque_cfg(full_data, user)
         if not cfg['simular'] and not (cfg['codigoLocal'] and cfg['motivo']):
             return jsonify({"error": "A baixa no estoque não está configurada."}), 409
@@ -6785,11 +6850,23 @@ HTML_PAGE = """
                     if (d.erro) alert('Não consegui listar os locais no Omie: ' + d.erro + '\\n\\nVocê pode digitar o código do local à mão.');
                 } catch (e) { alert('Erro de conexão'); }
             };
+            // O valor da saída é SEMPRE o registrado no Omie (custo médio). Só quem não tem valor no Omie é preenchido à mão.
+            const carregarValorItem = async (i, idProd) => {
+                reqSetItem(i, { valorCarregando: true });
+                try {
+                    const d = await fetch('/api/estoque/valor/' + idProd, { headers: { 'Authorization': auth.token } }).then(r => r.json());
+                    reqSetItem(i, { valorCarregando: false, valorOmie: (d.valor > 0 ? d.valor : null), valor: (d.valor > 0 ? d.valor : ''), saldo: (d.saldo === undefined ? null : d.saldo), valorErro: d.erro || '' });
+                } catch (e) { reqSetItem(i, { valorCarregando: false, valorErro: 'Não consegui consultar o valor no Omie.' }); }
+            };
+            const brl = (n) => 'R$ ' + Number(n).toFixed(2).replace('.', ',');
             const consumoEnviar = async () => {
                 const itens = reqForm.itens.filter(it => (it.descricao || '').trim());
                 if (!itens.length) { alert('Adicione ao menos um produto.'); return; }
                 if (itens.some(it => !it.idProd)) { alert('Escolha cada produto na lista do catálogo do Omie: digite o nome e clique na sugestão.'); return; }
                 if (itens.some(it => !(Number(String(it.qtd).replace(',', '.')) > 0))) { alert('Informe a quantidade de cada produto.'); return; }
+                if (itens.some(it => it.valorCarregando)) { alert('Aguarde: ainda buscando o valor no Omie.'); return; }
+                const semValor = itens.find(it => it.valorOmie === null && !(Number(String(it.valor).replace(',', '.')) > 0));
+                if (semValor) { alert('"' + semValor.descricao + '" não tem valor registrado no Omie. Preencha o valor unitário.'); return; }
                 const obs = (reqForm.observacao || '').trim();
                 if (obs.length < 3) { alert('Preencha a observação: ela vai junto no movimento de estoque do Omie.'); return; }
                 const sim = !!(estoqueCfg && estoqueCfg.simular);
@@ -9000,22 +9077,27 @@ HTML_PAGE = """
                                 <div key=${i} className="grid grid-cols-12 gap-2 items-start bg-slate-50 border border-slate-200 rounded-lg p-2">
                                     <div className="col-span-12 md:col-span-6 relative">
                                         <input value=${it.descricao} placeholder="Digite o nome ou código e escolha o produto na lista"
-                                            onInput=${e => { const v = e.target.value; reqSetItem(i, { descricao: v, codigo: '', idProd: null }); setReqBusca({ idx: i, q: v, results: [], msg: '' }); }}
+                                            onInput=${e => { const v = e.target.value; reqSetItem(i, { descricao: v, codigo: '', idProd: null, valorOmie: undefined, valor: '', saldo: null }); setReqBusca({ idx: i, q: v, results: [], msg: '' }); }}
                                             className="w-full p-2 border border-slate-300 rounded text-sm bg-white outline-none focus:ring-2 focus:ring-indigo-400" />
-                                        ${it.idProd ? html`<div className="text-[11px] text-emerald-700 mt-0.5"><i className="ph-fill ph-check-circle"></i> Produto do Omie · código ${it.codigo}</div>`
+                                        ${it.idProd ? html`<div className="text-[11px] text-emerald-700 mt-0.5"><i className="ph-fill ph-check-circle"></i> Produto do Omie · código ${it.codigo}${it.saldo !== null && it.saldo !== undefined ? ' · saldo ' + it.saldo : ''}${it.saldo !== null && it.saldo !== undefined && Number(String(it.qtd).replace(',', '.')) > it.saldo ? ' (quantidade acima do saldo)' : ''}</div>`
                                             : (it.descricao ? html`<div className="text-[11px] text-amber-600 mt-0.5">Clique na sugestão para escolher o produto do Omie.</div>` : '')}
                                         ${reqBusca.idx === i && (reqBusca.results.length > 0 || reqBusca.msg) && html`
                                             <div className="absolute z-20 left-0 right-0 mt-1 bg-white border border-slate-300 rounded-lg shadow-lg max-h-56 overflow-auto">
                                                 ${reqBusca.msg && html`<div className="p-2 text-xs text-slate-500">${reqBusca.msg.startsWith('Nada') ? 'Nada no catálogo do Omie.' : reqBusca.msg}</div>`}
                                                 ${reqBusca.results.map((p, k) => html`
-                                                    <button key=${k} type="button" onClick=${() => { reqSetItem(i, { codigo: p.code || '', descricao: p.description || '', unidade: p.unit || it.unidade, idProd: p.id }); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }}
+                                                    <button key=${k} type="button" onClick=${() => { reqSetItem(i, { codigo: p.code || '', descricao: p.description || '', unidade: p.unit || it.unidade, idProd: p.id }); carregarValorItem(i, p.id); setReqBusca({ idx: null, q: '', results: [], msg: '' }); }}
                                                         className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 border-b border-slate-100 last:border-0">
                                                         <span className="font-mono text-xs text-slate-500">${p.code}</span> ${p.description}
                                                     </button>`)}
                                             </div>`}
                                     </div>
                                     <div className="col-span-4 md:col-span-2"><input type="text" inputMode="decimal" value=${it.qtd} onInput=${e => reqSetItem(i, { qtd: e.target.value })} placeholder="Qtd" className="w-full p-2 border border-slate-300 rounded text-sm bg-white text-center" /></div>
-                                    <div className="col-span-6 md:col-span-3"><input type="text" inputMode="decimal" value=${it.valor} onInput=${e => reqSetItem(i, { valor: e.target.value })} placeholder="Valor unit. (se custo zerado)" title="O Omie usa o custo médio do produto. Preencha só se o custo estiver zerado." className="w-full p-2 border border-slate-300 rounded text-sm bg-white" /></div>
+                                    <div className="col-span-6 md:col-span-3">
+                                        ${!it.idProd ? html`<input disabled placeholder="Valor unit." className="w-full p-2 border border-slate-200 rounded text-sm bg-slate-100 text-slate-400" />`
+                                          : it.valorCarregando ? html`<div className="p-2 text-xs text-slate-400"><i className="ph ph-spinner animate-spin"></i> buscando valor no Omie…</div>`
+                                          : it.valorOmie > 0 ? html`<div className="p-2 border border-emerald-200 bg-emerald-50 rounded text-sm text-emerald-800" title="Custo médio registrado no Omie. Não é editável."><span className="font-semibold">${brl(it.valorOmie)}</span> <span className="text-[11px]">valor do Omie</span></div>`
+                                          : html`<input type="text" inputMode="decimal" value=${it.valor} onInput=${e => reqSetItem(i, { valor: e.target.value })} placeholder="Sem valor no Omie: informe" title="Este produto não tem valor registrado no Omie. Preencha o valor unitário." className="w-full p-2 border border-red-300 rounded text-sm bg-white" />`}
+                                    </div>
                                     <div className="col-span-2 md:col-span-1 text-right"><button onClick=${() => reqDelItem(i)} disabled=${reqForm.itens.length <= 1} className="p-2 text-red-500 hover:text-red-700 disabled:opacity-30" title="Remover produto"><i className="ph-bold ph-trash"></i></button></div>
                                 </div>`)}
                             <button onClick=${() => setReqForm(f => ({ ...f, itens: [...f.itens, { ...reqItemVazio(), idProd: null, valor: '' }] }))} className="text-indigo-600 hover:text-indigo-700 text-sm font-medium flex items-center gap-1"><i className="ph-bold ph-plus-circle"></i> Adicionar outro produto</button>
@@ -9140,7 +9222,7 @@ HTML_PAGE = """
                                             ${consumo && it.baixa && it.baixa.ok ? html`<div className="text-xs text-emerald-700"><i className="ph-fill ph-check-circle"></i> ${it.baixa.simulada ? 'simulado (não baixou no Omie)' : 'baixa feita no Omie'}</div>` : ''}
                                             ${consumo && it.baixa && !it.baixa.ok ? html`
                                                 <div className="text-xs text-red-600 mt-0.5"><i className="ph-fill ph-warning-circle"></i> ${it.baixa.erro}</div>
-                                                ${reqAlmox ? html`<input type="text" inputMode="decimal" value=${reqValores[r.id + '_' + k] !== undefined ? reqValores[r.id + '_' + k] : (it.valor || '')} onInput=${e => setReqValores(v => ({ ...v, [r.id + '_' + k]: e.target.value }))} placeholder="Valor unit. (se o Omie pediu)" className="mt-1 w-48 p-1 border border-slate-300 rounded text-xs bg-white" />` : ''}` : ''}
+                                                ${reqAlmox && it.valorOrigem !== 'omie' ? html`<input type="text" inputMode="decimal" value=${reqValores[r.id + '_' + k] !== undefined ? reqValores[r.id + '_' + k] : (it.valor || '')} onInput=${e => setReqValores(v => ({ ...v, [r.id + '_' + k]: e.target.value }))} placeholder="Valor unit. (se o Omie pediu)" className="mt-1 w-48 p-1 border border-slate-300 rounded text-xs bg-white" />` : ''}` : ''}
                                         </div>
                                         <div className="whitespace-nowrap text-right font-medium">
                                             ${it.qtdAtendida !== null && it.qtdAtendida !== undefined
