@@ -92,6 +92,30 @@ def enderecos_da_rede():
     return ips
 
 
+class LogAcesso:
+    """Registra cada acesso (quem, o quê, resultado, tempo) no servidor.log. Serve para descobrir por que um aparelho
+    não consegue entrar: se a linha dele não aparece, a requisição nem chegou ao servidor (problema de rede)."""
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        import time
+        t0 = time.time()
+        res = {}
+
+        def sr(status, headers, exc_info=None):
+            res['s'] = status.split(' ')[0]
+            return start_response(status, headers, exc_info)
+        try:
+            return self.app(environ, sr)
+        finally:
+            ua = (environ.get('HTTP_USER_AGENT') or '-')[:70]
+            caminho = environ.get('PATH_INFO', '')
+            if not caminho.startswith('/api/painel/rev'):      # esse é chamado a cada 8 s por cada painel aberto
+                _log_tela.info(f"ACESSO {environ.get('REMOTE_ADDR')} {environ.get('REQUEST_METHOD')} {caminho} {res.get('s', '-')} "
+                               f"{int((time.time() - t0) * 1000)}ms {ua}")
+
+
 def main():
     print('=' * 62)
     print(' BIODRON SMART REPORT PRO — servidor local (waitress)')
@@ -113,7 +137,7 @@ def main():
     print(' Para parar: Ctrl+C (ou feche a janela).\n')
     # threads=1: mesmo comportamento do Render (1 worker): os dados ficam num arquivo JSON e as requisições
     # são atendidas uma por vez, sem risco de duas gravações simultâneas se perderem.
-    serve(smart_report.app, host='0.0.0.0', port=PORTA, threads=1, ident='SmartReport',
+    serve(LogAcesso(smart_report.app), host='0.0.0.0', port=PORTA, threads=1, ident='SmartReport',
           channel_timeout=300, cleanup_interval=30, max_request_body_size=80 * 1024 * 1024)
 
 
