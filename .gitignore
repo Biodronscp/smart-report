@@ -8,3 +8,5 @@ bateria_data.json
 .idea/
 .vscode/
 servidor_local/config.env
+instalador/_staging/
+instalador/saida/

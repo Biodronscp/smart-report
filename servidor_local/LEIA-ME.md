@@ -52,3 +52,37 @@ Neste notebook, em *Opções de energia*, coloque "Suspender: Nunca" quando liga
 
 ## Atualizar o sistema local
 Quando houver versão nova: `git pull` na pasta do projeto e reiniciar o servidor.
+
+---
+
+## Mudar o servidor para outro PC (instalador)
+O instalador `SmartReport-Setup-<versão>.exe` leva o Python e as bibliotecas dentro dele (não precisa de internet nem de Python no PC novo).
+
+**No computador ANTIGO (o que roda o servidor hoje)**
+1. Menu Iniciar → *Biodron Smart Report* → **Gerar backup para mudança de PC** (ou `servidor_local\exportar_para_mudanca.bat`).
+   Gera `SmartReport-Dados-AAAAMMDD_HHMM.zip` na Área de Trabalho: dados, anexos, laudos, chave do robô e as chaves do config.env.
+   **O ZIP tem segredos** (Omie, senhas): guarde como senha e apague depois.
+2. Pare de usar o sistema (o que for gravado depois do backup não vai para o PC novo).
+
+**No computador NOVO**
+1. Rode `SmartReport-Setup-<versão>.exe` (pede administrador uma vez). O Windows pode avisar "editor desconhecido" (o instalador não é assinado): *Mais informações → Executar assim mesmo*.
+2. Siga o assistente: pasta do programa, **pasta dos dados** (padrão `C:\SmartReportDados`), **porta** (padrão 5001) e, no passo *Restaurar dados*, escolha o ZIP do backup.
+3. Deixe marcadas as opções **iniciar com o Windows** (roda mesmo sem ninguém logado) e **liberar o Firewall** (redes privadas).
+4. Pronto: o servidor sobe sozinho. Acesse `http://IP-DO-PC-NOVO:5001`.
+
+**Depois de trocar (checklist)**
+- Reservar o IP do PC novo no roteador (ou lembrar de trocar o endereço da TV, dos celulares e dos atalhos).
+- Robô de faturamento (`omie_faturar`): apontar `SR_BASE` para o endereço novo (a chave de API do robô veio no backup).
+- Opções de energia do PC novo: "Suspender: Nunca" na tomada.
+- Desligar o servidor do PC antigo (menu Iniciar → *Parar servidor*, e remover a tarefa `SmartReportServidorLocal`, se existir).
+- Se o PC novo estiver numa rede onde alguém usa Chrome no Android e der erro, veja a seção de acesso por celular acima.
+
+**Instalar sem o assistente (silencioso):**
+`SmartReport-Setup-1.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /DADOS="D:\SmartReportDados" /PORTA=5001 /BACKUP="C:\...\SmartReport-Dados.zip"`
+(`/NAOINICIAR=1` instala sem ligar o servidor.)
+
+**Atualizar versão:** rode o instalador novo por cima. A configuração e os dados são mantidos; ele não pergunta de novo.
+**Desinstalar:** Configurações do Windows → Aplicativos. Os **dados não são apagados** (ficam na pasta de dados).
+
+**Gerar o instalador** (neste projeto): `powershell -ExecutionPolicy Bypass -File instalador\montar.ps1 -Versao 1.0.0`
+(precisa do `.venv` do projeto e do Inno Setup 6; o resultado sai em `instalador\saida\`).
