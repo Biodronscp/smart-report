@@ -576,6 +576,16 @@ def filiais_publicas():
     return jsonify([{"id": fid, "nome": (f or {}).get('nome') or fid} for fid, f in filiais.items()])
 
 
+def _usuario_por_nome(full_data, nome):
+    """Nome exato de um usuário. Se não houver igual, aceita o ÚNICO que difere só em maiúsculas/minúsculas
+    (teclado de TV/celular troca o 'T' de 'Tv'). Com dois candidatos não adivinha: devolve None."""
+    users = full_data.get('users') or {}
+    if nome in users:
+        return nome
+    achados = [u for u in users if u.lower() == (nome or '').lower()]
+    return achados[0] if len(achados) == 1 else None
+
+
 @app.route('/api/login', methods=['POST'])
 def login():
     creds = request.json or {}
@@ -583,12 +593,15 @@ def login():
     password = creds.get('password') or ''
     full_data = load_data()
 
-    if _login_blocked(username):
+    # o limite de tentativas conta por nome SEM diferenciar maiúsculas (senão bastaria variar a caixa para burlá-lo)
+    chave_limite = username.lower()
+    if _login_blocked(chave_limite):
         return jsonify({"success": False, "message": "Muitas tentativas. Aguarde alguns minutos e tente novamente."}), 429
 
+    username = _usuario_por_nome(full_data, username) or username
     user = full_data['users'].get(username)
     if not user or not verify_password(password, user.get('passwordHash', '')):
-        _login_record_fail(username)
+        _login_record_fail(chave_limite)
         return jsonify({"success": False, "message": "Usuário ou senha incorretos."}), 401
 
     status = user.get('status', 'active')
@@ -661,7 +674,7 @@ def register():
         return jsonify({"success": False, "message": "Telefone inválido."}), 400
 
     full_data = load_data()
-    if username in full_data['users']:
+    if any(u.lower() == username.lower() for u in full_data['users']):   # "Tv" e "tv" contam como o mesmo login
         return jsonify({"success": False, "message": "Esse login já está em uso."}), 400
     for u in full_data['users'].values():
         if u.get('email', '').lower() == email and email:
@@ -923,7 +936,7 @@ def manage_users():
             return jsonify({"error": "Preencha usuário e senha"}), 400
         if len(new_pass) < 6:
             return jsonify({"error": "A senha deve ter no mínimo 6 caracteres"}), 400
-        if new_user in full_data['users']:
+        if any(u.lower() == new_user.lower() for u in full_data['users']):
             return jsonify({"error": "Usuário já existe"}), 400
 
         full_data['users'][new_user] = {
