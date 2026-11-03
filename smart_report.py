@@ -1536,6 +1536,10 @@ class OmieNoRecords(Exception):
 
 def omie_call(endpoint: str, call: str, param: dict, timeout: int = 20):
     """Chama a API Omie. endpoint ex: '/geral/clientes/'. param é um dict (vai virar lista de 1 elemento)."""
+    # Servidor de TESTE (OMIE_SOMENTE_LEITURA=1): só deixa passar leitura. Impede que uma cópia dos dados de produção,
+    # com as credenciais reais, grave no Omie de verdade (enviar OS, baixar estoque, trocar etapa...).
+    if os.environ.get("OMIE_SOMENTE_LEITURA") == "1" and not re.match(r'^(Listar|Consultar|Obter|Pesquisar)', call or ''):
+        raise OmieError(f"Servidor de teste: gravação no Omie bloqueada ({call}).", status=403)
     # Usa credenciais da filial do usuário (setadas em g), com fallback pras env vars
     app_key = getattr(g, 'omie_app_key', None) or os.environ.get("OMIE_APP_KEY")
     app_secret = getattr(g, 'omie_app_secret', None) or os.environ.get("OMIE_APP_SECRET")

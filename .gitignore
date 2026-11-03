@@ -7,3 +7,4 @@ venv/
 bateria_data.json
 .idea/
 .vscode/
+servidor_local/config.env
