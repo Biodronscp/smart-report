@@ -92,6 +92,43 @@ def enderecos_da_rede():
     return ips
 
 
+class Comprime:
+    """Comprime (gzip) páginas e dados de texto, como o Render fazia: a tela principal cai de ~480 KB para ~100 KB,
+    o que acelera o Wi-Fi e evita travar em aparelhos mais sensíveis. Não mexe em imagens, vídeos nem em downloads."""
+    TIPOS = ('text/', 'application/json', 'application/javascript', 'application/manifest+json', 'image/svg+xml')
+
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        import gzip
+        if 'gzip' not in (environ.get('HTTP_ACCEPT_ENCODING') or '').lower() or environ.get('HTTP_RANGE') \
+                or environ.get('REQUEST_METHOD') == 'HEAD':
+            return self.app(environ, start_response)
+        cap = {}
+
+        def sr(status, headers, exc_info=None):
+            cap['status'], cap['headers'], cap['exc'] = status, list(headers), exc_info
+            return lambda dado: None
+        it = self.app(environ, sr)
+        hd = {k.lower(): v for k, v in cap['headers']}
+        tamanho = int(hd.get('content-length') or 0)
+        if (cap['status'].startswith('200') and 1024 < tamanho <= 20 * 1024 * 1024 and 'content-encoding' not in hd
+                and any(hd.get('content-type', '').startswith(t) for t in self.TIPOS)):
+            try:
+                corpo = b''.join(it)
+            finally:
+                if hasattr(it, 'close'):
+                    it.close()
+            corpo = gzip.compress(corpo, 5)
+            cab = [(k, v) for k, v in cap['headers'] if k.lower() != 'content-length']
+            cab += [('Content-Encoding', 'gzip'), ('Content-Length', str(len(corpo))), ('Vary', 'Accept-Encoding')]
+            start_response(cap['status'], cab, cap['exc'])
+            return [corpo]
+        start_response(cap['status'], cap['headers'], cap['exc'])
+        return it
+
+
 class LogAcesso:
     """Registra cada acesso (quem, o quê, resultado, tempo) no servidor.log. Serve para descobrir por que um aparelho
     não consegue entrar: se a linha dele não aparece, a requisição nem chegou ao servidor (problema de rede)."""
@@ -109,7 +146,7 @@ class LogAcesso:
         try:
             return self.app(environ, sr)
         finally:
-            ua = (environ.get('HTTP_USER_AGENT') or '-')[:70]
+            ua = (environ.get('HTTP_USER_AGENT') or '-')[:180]
             caminho = environ.get('PATH_INFO', '')
             if not caminho.startswith('/api/painel/rev'):      # esse é chamado a cada 8 s por cada painel aberto
                 _log_tela.info(f"ACESSO {environ.get('REMOTE_ADDR')} {environ.get('REQUEST_METHOD')} {caminho} {res.get('s', '-')} "
@@ -137,8 +174,8 @@ def main():
     print(' Para parar: Ctrl+C (ou feche a janela).\n')
     # threads=1: mesmo comportamento do Render (1 worker): os dados ficam num arquivo JSON e as requisições
     # são atendidas uma por vez, sem risco de duas gravações simultâneas se perderem.
-    serve(LogAcesso(smart_report.app), host='0.0.0.0', port=PORTA, threads=1, ident='SmartReport',
-          channel_timeout=300, cleanup_interval=30, max_request_body_size=80 * 1024 * 1024)
+    serve(LogAcesso(Comprime(smart_report.app)), host='0.0.0.0', port=PORTA, threads=1, ident='SmartReport',
+          channel_timeout=300, cleanup_interval=30, max_request_body_size=80 * 1024 * 1024, log_socket_errors=True)
 
 
 if __name__ == '__main__':
