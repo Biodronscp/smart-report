@@ -1343,6 +1343,98 @@ def manage_filiais():
         return jsonify({"success": True})
 
 
+# ==========================================================
+#  SNAPSHOT COMPLETO (administrador): tudo que o servidor guarda, para levar a outro servidor (migração).
+#  Diferente do export-config: inclui o arquivo de dados INTEIRO (chaves de API do robô, sessões, filiais com as
+#  credenciais do Omie, configuração da baixa de estoque...) e as pastas de arquivos (anexos de teste, PDFs, fotos).
+# ==========================================================
+SNAPSHOT_PASTAS = ('laudo_assets', 'laudos_pdf', 'testes_midia')
+SNAPSHOT_ENV = ('GEMINI_API_KEY', 'GEMINI_MODEL', 'OMIE_WEBHOOK_TOKEN', 'OMIE_APP_KEY', 'OMIE_APP_SECRET', 'MIDIA_MAX_TOTAL_MB')
+
+
+def _snapshot_base():
+    return os.path.dirname(os.path.abspath(DATA_FILE)) or '.'
+
+
+def _tamanho_pasta(pasta):
+    n, b = 0, 0
+    for raiz, _d, arqs in os.walk(pasta):
+        for a in arqs:
+            try:
+                b += os.path.getsize(os.path.join(raiz, a))
+                n += 1
+            except OSError:
+                pass
+    return n, b
+
+
+@app.route('/api/admin/snapshot-info', methods=['GET'])
+def admin_snapshot_info():
+    """Tamanho do que o snapshot vai levar e quais variáveis de ambiente existem (sem mostrar os valores)."""
+    user, full_data, err = _require_admin()
+    if err:
+        return err
+    base = _snapshot_base()
+    pastas = {}
+    for nome in SNAPSHOT_PASTAS:
+        n, b = _tamanho_pasta(os.path.join(base, nome))
+        pastas[nome] = {"arquivos": n, "bytes": b}
+    return jsonify({
+        "dados": {"bytes": os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0}, "pastas": pastas,
+        "envPresentes": {k: bool(os.environ.get(k)) for k in SNAPSHOT_ENV},
+        "apiTokens": len(full_data.get('apiTokens') or {}), "usuarios": len(full_data.get('users') or {}),
+    })
+
+
+@app.route('/api/admin/snapshot', methods=['GET'])
+def admin_snapshot():
+    """ZIP com o arquivo de dados + pastas de arquivos + meta.json. Com ?env=1 leva também as variáveis de ambiente
+    (chaves do Gemini/Omie) — só use por conexão confiável e guarde o ZIP como segredo."""
+    import zipfile
+    import tempfile
+    from flask import send_file
+    user, full_data, err = _require_admin()
+    if err:
+        return err
+    base = _snapshot_base()
+    import time as _t
+    for nome in os.listdir(base):   # rede de segurança: ZIPs temporários esquecidos (> 10 min) são apagados
+        cam = os.path.join(base, nome)
+        if nome.startswith('snapshot_') and nome.endswith('.zip') and _t.time() - os.path.getmtime(cam) > 600:
+            try:
+                os.remove(cam)
+            except OSError:
+                pass
+    fd, tmp = tempfile.mkstemp(prefix='snapshot_', suffix='.zip', dir=base)
+    os.close(fd)
+    n_arq = 0
+    try:
+        with zipfile.ZipFile(tmp, 'w') as z:
+            z.write(DATA_FILE, 'bateria_data.json', compress_type=zipfile.ZIP_DEFLATED)
+            for nome in SNAPSHOT_PASTAS:
+                raiz_pasta = os.path.join(base, nome)
+                for raiz, _d, arqs in os.walk(raiz_pasta):
+                    for a in arqs:
+                        cam = os.path.join(raiz, a)
+                        z.write(cam, os.path.join(nome, os.path.relpath(cam, raiz_pasta)).replace('\\', '/'), compress_type=zipfile.ZIP_STORED)
+                        n_arq += 1
+            meta = {"geradoEm": datetime.utcnow().isoformat() + "Z", "geradoPor": user, "arquivos": n_arq,
+                    "usuarios": len(full_data.get('users') or {}), "apiTokens": len(full_data.get('apiTokens') or {})}
+            if request.args.get('env') == '1':
+                meta["env"] = {k: os.environ[k] for k in SNAPSHOT_ENV if os.environ.get(k)}
+            z.writestr('meta.json', json.dumps(meta, ensure_ascii=False))
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    resp = send_file(tmp, mimetype='application/zip', as_attachment=True,
+                     download_name='snapshot_smart_' + datetime.utcnow().strftime('%Y%m%d_%H%M%S') + '.zip')
+    resp.call_on_close(lambda: os.path.exists(tmp) and os.remove(tmp))
+    return resp
+
+
 @app.route('/api/export-config', methods=['GET'])
 def export_config():
     """Exporta TUDO (config global, usuários, laudos, OS/osDrafts, filiais) como JSON —
