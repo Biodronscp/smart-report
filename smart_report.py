@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request, Response, g, send_from_directory
 import json
 import os
+import threading
+import time
 import socket
 import re
 import secrets
@@ -1639,8 +1641,28 @@ class OmieNoRecords(Exception):
     pass
 
 
+_OMIE_BLOQUEIO_ATE = 0.0   # epoch: o Omie bloqueou a API por consumo indevido até este instante
+
+
+def _omie_bloqueio_checar():
+    """Se o Omie já nos bloqueou, nem chama de novo (cada tentativa durante o bloqueio só piora)."""
+    resta = _OMIE_BLOQUEIO_ATE - time.time()
+    if resta > 0:
+        raise OmieError(f"O Omie bloqueou a API por excesso de requisições. Aguarde cerca de {int(resta // 60) + 1} min e tente de novo.", status=429)
+
+
+def _omie_bloqueio_registrar(msg):
+    """Lê 'API bloqueada por consumo indevido. Tente novamente em N segundos' e guarda até quando."""
+    global _OMIE_BLOQUEIO_ATE
+    mm = re.search(r'bloqueada por consumo indevido.*?(\d+)\s*segundos', str(msg or ''), re.I | re.S)
+    if mm:
+        _OMIE_BLOQUEIO_ATE = time.time() + int(mm.group(1)) + 5
+        print(f"[OMIE] API bloqueada por consumo indevido; pausando chamadas por {mm.group(1)} s", flush=True)
+
+
 def omie_call(endpoint: str, call: str, param: dict, timeout: int = 20):
     """Chama a API Omie. endpoint ex: '/geral/clientes/'. param é um dict (vai virar lista de 1 elemento)."""
+    _omie_bloqueio_checar()
     # Servidor de TESTE (OMIE_SOMENTE_LEITURA=1): só deixa passar leitura. Impede que uma cópia dos dados de produção,
     # com as credenciais reais, grave no Omie de verdade (enviar OS, baixar estoque, trocar etapa...).
     if os.environ.get("OMIE_SOMENTE_LEITURA") == "1" and not re.match(r'^(Listar|Consultar|Obter|Pesquisar)', call or ''):
@@ -1677,9 +1699,12 @@ def omie_call(endpoint: str, call: str, param: dict, timeout: int = 20):
         # Tratamento especial: lista vazia vem como erro
         if fault and ('ERROR-0' in fault or 'não existem registros' in fault.lower() or 'nao existem registros' in fault.lower() or 'no records' in fault.lower()):
             raise OmieNoRecords()
+        _omie_bloqueio_registrar(msg)
         raise OmieError(f"Omie: {msg}", status=502, payload={"http": e.code})
     except URLError as e:
         raise OmieError(f"Falha de conexão com Omie: {e.reason}", status=502)
+    except (TimeoutError, OSError) as e:   # estouro de tempo na leitura (não vem como URLError)
+        raise OmieError(f"Tempo esgotado falando com o Omie ({type(e).__name__}).", status=504)
 
     try:
         return json.loads(raw)
@@ -1867,7 +1892,7 @@ def _incluir_anexo_omie(c_tabela, n_id, filename, tipo, arquivo_b64, md5, tag):
         "cTipoArquivo": tipo,
         "cArquivo": arquivo_b64,
         "cMd5": md5
-    })
+    }, timeout=600)   # vídeo grande: o envio leva minutos (20 s padrão estourava)
 
 
 @app.route('/api/faturamento/os/<path:os_num>/itens', methods=['GET'])
@@ -4382,6 +4407,662 @@ def os_teste_midia_ver(os_id, mid):
     return resp
 
 
+# =====================================================================================================
+# RELATÓRIO DE MANUTENÇÕES POR EQUIPAMENTO (admin / admin_master) — SOMENTE LEITURA no Omie.
+# Lê as OS e os pedidos de venda de UM cliente num período e gera um .xlsx (openpyxl). Roda em segundo plano
+# (o servidor tem 1 thread): a tela acompanha pelo GET .../status e baixa o arquivo quando fica pronto.
+# Regras de negócio: nº de série só existe no texto (regex), entrada = (série, OP) ou (série, data), OS de laudo e
+# OS faturada do mesmo atendimento = 1 entrada, OS canceladas não contam, peças ligadas pelo nº da OS/série do pedido.
+# =====================================================================================================
+_RM_JOBS = {}
+_RM_JOBS_LOCK = threading.Lock()
+_RM_CACHE = {}     # (cliente, de, até) -> (epoch, [OS do cliente], [pedidos]) — evita bater de novo no Omie ao refazer o arquivo
+_RM_SER = re.compile(r'\b(?=[0-9A-Z]*\d)(?=[0-9A-Z]*[A-Z])[0-9A-Z]{13,15}\b')
+_RM_ETAPA = {'00': 'Aguardando orçamento/aprovação', '30': 'Executada, aguardando faturamento', '40': 'Parada'}
+
+
+def _rm_d(s):
+    try:
+        return datetime.strptime(s, '%d/%m/%Y').date() if s else None
+    except Exception:
+        return None
+
+
+def _rm_limpa(s):
+    import html as _h
+    return _h.unescape(s or '').replace('M©', 'MΩ')
+
+
+def _rm_int(v, padrao=0):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return padrao
+
+
+def _rm_num(v):
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+
+def _rm_tipo_serie(s):
+    if s.startswith(('63YB', '64TB')):
+        return 'Drone'
+    if s.startswith('57P'):
+        return 'Bateria'
+    if s.startswith(('5DB', '5D2')):
+        return 'Carregador'
+    if s.startswith('5E4'):
+        return 'Motor'
+    if s.startswith('4L'):
+        return 'Controle remoto'
+    return ''
+
+
+def _rm_modelo_serie(s):
+    if s.startswith('64TB'):
+        return 'T40'
+    if s.startswith('63YB'):
+        return 'T50'
+    return ''
+
+
+def _rm_analisa(os_cli, pedidos):
+    """Monta registros de OS, entradas ("visitas") por série e liga os pedidos. Devolve (recs, visitas, nao_ligados, notas)."""
+    import collections
+    SER = _RM_SER
+    ctrl = lambda s: s.startswith('4L')     # série de controle remoto: não vale como série do drone
+    recs = []
+    for o in sorted(os_cli, key=lambda o: _rm_int((o.get('Cabecalho') or {}).get('cNumOS'))):
+        c = o.get('Cabecalho') or {}
+        i = o.get('InfoCadastro') or {}
+        nf = _rm_limpa((o.get('InformacoesAdicionais') or {}).get('cDadosAdicNF')).strip()
+        obs = _rm_limpa((o.get('Observacoes') or {}).get('cObsOS'))
+        svs = o.get('ServicosPrestados') or []
+        svtxt = ' '.join(_rm_limpa(s.get('cDescServ')) for s in svs)
+        allt = (nf + ' ' + obs + ' ' + svtxt).upper()
+        sers = list(dict.fromkeys(SER.findall(allt)))
+        op = None
+        m = re.search(r'OP\s*(20\d\d)/(\d+)|OPORTUNIDADE CRM N. (20\d\d)/(\d+)', allt)
+        if m:
+            op = f"{m.group(1) or m.group(3)}/{int(m.group(2) or m.group(4)):05d}"
+        md = re.search(r'\bem (\d\d/\d\d/\d{4}) ', obs)
+        dinc = _rm_d(i.get('dDtInc')) or _rm_d(i.get('dDtFat')) or datetime.utcnow().date()
+        dts = [dinc] + ([_rm_d(md.group(1))] if md and _rm_d(md.group(1)) else [])
+        s0 = svs[0] if svs else {}
+        nome = _rm_limpa(s0.get('cDescServ')).split('|')[0].replace('Serviços prestados:', '').strip() or 'Serviços prestados'
+        qtd, vu = s0.get('nQtde'), s0.get('nValUnit')
+        laudo, defeito = [], ''
+        mm = re.search(r'4\. Proposta de Servi.o[^\n|]*\|(.*?)\|\|?5\. Protocolo', svtxt, re.S)
+        if mm:
+            laudo = [x.strip(' -') for x in mm.group(1).split('|') if x.strip(' -')]
+        m2 = re.search(r'Defeito alegado pelo cliente:\s*(.*?)\|\|', svtxt, re.S | re.I) or re.search(r'Defeito Alegado pelo Cliente:\s*([^|]+)', svtxt)
+        if m2:
+            defeito = m2.group(1).replace('|', ' / ').strip()
+        m3 = re.search(r'oportunidade\s+\S+(?:\s+-\s+(.*?))?\s{3,}', obs + '   ')
+        if not defeito and m3 and m3.group(1):
+            defeito = m3.group(1).strip()
+        if not defeito:
+            m4 = re.search(r'DEFEITO:\s*(.*)', nf + ' ' + svtxt)
+            if m4:
+                defeito = m4.group(1).split('||')[0].split('|')[0].strip()
+        if not defeito:
+            defeito = ' - '.join(x.strip() for x in nf.replace('||', '|').split('|') if x.strip())[:160]
+        ctipo = ''
+        for k, v in [('CARREGADOR', 'Carregador'), ('BATERIA', 'Bateria'), ('MOTOR', 'Motor'), ('CONTROLE', 'Controle remoto')]:
+            if k in (nf + ' ' + nome).upper():
+                ctipo = v
+                break
+        recs.append(dict(n=_rm_int(c.get('cNumOS')), cancel=(i.get('cCancelada') == 'S'), fatd=(i.get('cFaturada') == 'S'),
+                         etapa=c.get('cEtapa') or '', sers=sers, op=op, dts=dts, dt=min(dts), nome=nome, qtd=qtd, vu=vu,
+                         val=_rm_num(c.get('nValorTotal')), laudo=laudo, defeito=defeito, ctipo=ctipo, nf=nf, obs=obs,
+                         svtxt=svtxt, fat=_rm_d(i.get('dDtFat')), via=''))
+    # série da OS: a do texto; sem série herda a da outra OS da mesma OP; "final XXXXXXX" casa pelo sufixo
+    opmap = {}
+    for r in recs:
+        ss = [s for s in r['sers'] if not ctrl(s)]
+        if ss and r['op']:
+            opmap[r['op']] = ss[0]
+    known = {s for r in recs for s in r['sers']}
+    for r in recs:
+        ss = [s for s in r['sers'] if not ctrl(s) or r['ctipo'] == 'Controle remoto']
+        ser = ss[0] if ss else ''
+        if not ser and r['op'] and opmap.get(r['op']):
+            ser = opmap[r['op']]
+            r['via'] = f"nº da oportunidade {r['op']}"
+        if not ser:
+            m = re.search(r'FINAL\s*-?\s*([0-9A-Z]{6,10})', (r['nf'] + r['svtxt']).upper())
+            if m:
+                f = [k for k in sorted(known) if k.endswith(m.group(1))]
+                if f:
+                    ser = f[0]
+                    r['via'] = f"final {m.group(1)}"
+        r['ser'] = ser
+    for r in recs:
+        r['tipo'] = _rm_tipo_serie(r['ser']) if r['ser'] else (r['ctipo'] or 'Drone')
+        mm = re.search(r'\bT(20P|25P|30|40|50)\b', (r['nf'] + r['svtxt'] + r['obs']).upper())
+        r['modelo'] = _rm_modelo_serie(r['ser']) or (('T' + mm.group(1)) if mm else '')
+    # pedidos de venda
+    pvl = []
+    for q in pedidos:
+        cb = q.get('cabecalho') or {}
+        ob = _rm_limpa((q.get('observacoes') or {}).get('obs_venda'))
+        sers = SER.findall(ob.upper())
+        mo = re.search(r'Ordem de Servi.o n. ?(\d+)', ob)
+        its = []
+        for x in (q.get('det') or []):
+            pr = x.get('produto') or {}
+            its.append((_rm_num(pr.get('quantidade')), _rm_limpa(pr.get('descricao')), _rm_num(pr.get('valor_total'))))
+        pvl.append(dict(n=_rm_int(cb.get('numero_pedido')), dt=_rm_d(cb.get('data_previsao')),
+                        val=_rm_num((q.get('total_pedido') or {}).get('valor_total_pedido')), et=cb.get('etapa') or '',
+                        ser=sers[0] if sers else '', os=int(mo.group(1)) if mo else None, its=its))
+    byos = {r['n']: r for r in recs}
+    for p in pvl:
+        if p['os'] and p['os'] in byos and byos[p['os']]['ser']:
+            p['ser'] = byos[p['os']]['ser']
+    # entradas: (série, OP) ou (série, data); laudo + OS faturada do mesmo atendimento = 1 entrada
+    vis = collections.defaultdict(list)
+    for r in recs:
+        r['key'] = (r['ser'], r['op'] if r['op'] else r['dt'])
+        if r['ser']:
+            vis[r['key']].append(r)
+    visitas = collections.defaultdict(list)
+    for key, rs in vis.items():
+        ativos = [x for x in rs if not x['cancel']]
+        if any(x['fatd'] for x in ativos):
+            ativos = [x for x in ativos if x['fatd']]
+        visitas[key[0]].append(dict(ser=key[0], rs=rs, ativos=ativos, dt=min(x['dt'] for x in rs), peds=[]))
+    for s in visitas:
+        visitas[s].sort(key=lambda v: v['dt'])
+    nao_ligados = []
+    for p in pvl:
+        if p['ser'] and p['ser'] in visitas and p['et'] != '00':
+            vs = visitas[p['ser']]
+            if p['os']:
+                tgt = [v for v in vs if any(x['n'] == p['os'] for x in v['rs'])]
+                v = tgt[0] if tgt else None
+            else:
+                cand = [v for v in vs if p['dt'] and v['dt'] <= p['dt']] or vs
+                v = max(cand, key=lambda v: v['dt'])
+            if v:
+                v['peds'].append(p)
+                continue
+        nao_ligados.append(p)
+    return recs, visitas, nao_ligados
+
+
+def _rm_situacao(v):
+    if not v['ativos']:
+        return 'Cancelada'
+    s = 'Concluída e faturada' if all(x['fatd'] for x in v['ativos']) else 'Em andamento - ' + _RM_ETAPA.get(v['ativos'][-1]['etapa'], 'em aberto')
+    fat = [p for p in v['peds'] if p['et'] == '60']
+    if len(fat) >= 2:
+        s += ' ⚠ POSSÍVEL COBRANÇA EM DOBRO: pedidos ' + ', '.join(str(p['n']) for p in fat) + ' faturados'
+    return s
+
+
+def _rm_brl(x):
+    return ('R$ {:,.2f}'.format(x)).replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+def _rm_o_que(v, ocultar):
+    partes = []
+    for x in v['ativos'] or v['rs']:
+        if x['qtd'] and x['vu'] and x['nome'] and 'Aluguel' not in x['nome']:
+            nm = x['nome'].capitalize().replace('dji', 'DJI').replace('agras', 'Agras')
+            q = _rm_num(x['qtd'])
+            if ocultar:
+                partes.append(f"OS {x['n']}: {nm} — mão de obra {q:g} h")
+            else:
+                partes.append(f"OS {x['n']}: {nm} — mão de obra {q:g} × {_rm_brl(_rm_num(x['vu']))}")
+        else:
+            partes.append(f"OS {x['n']}: {x['nome']}")
+    lau = []
+    for x in v['rs']:
+        for l in x['laudo']:
+            if l not in lau:
+                lau.append(l)
+    txt = '\n'.join(partes)
+    if lau:
+        txt += '\nServiços do laudo: ' + '; '.join(lau)
+    pecas = [f"{q:g}x {ds}" for p in v['peds'] for q, ds, vt in p['its']]
+    return txt, pecas
+
+
+def _rm_pares_parecidos(series):
+    """Séries do mesmo tamanho que diferem em exatamente 1 caractere (possível erro de digitação)."""
+    out = []
+    ss = sorted(series)
+    for a in range(len(ss)):
+        for b in range(a + 1, len(ss)):
+            x, y = ss[a], ss[b]
+            if len(x) == len(y) and sum(1 for c1, c2 in zip(x, y) if c1 != c2) == 1:
+                out.append((x, y))
+    return out
+
+
+def _rm_montar(os_cli, pedidos, cli_nome, de_txt, ate_txt, ocultar):
+    """Gera o .xlsx. Devolve (bytes, resumo)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    recs, visitas, nao_ligados = _rm_analisa(os_cli, pedidos)
+    ORD = {'Drone': 0, 'Bateria': 1, 'Carregador': 2, 'Motor': 3, 'Controle remoto': 4}
+    eqs = []
+    for s, vs in visitas.items():
+        r0 = vs[0]['rs'][0]
+        tipo = _rm_tipo_serie(s) or r0['tipo']
+        mod = next((x['modelo'] for v in vs for x in v['rs'] if x['modelo']), '')
+        vv = [v for v in vs if v['ativos']]
+        eqs.append(dict(ser=s, tipo=tipo, mod=mod, vs=vv))
+    eqs = [e for e in eqs if e['vs']]
+    eqs.sort(key=lambda e: (ORD.get(e['tipo'], 9), -len(e['vs']), e['ser']))
+    n_ent = sum(len(e['vs']) for e in eqs)
+    sem_serie = [r for r in recs if not r['ser'] and not r['cancel']]
+
+    F = Font(name='Calibri', size=10)
+    H = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
+    HF = PatternFill('solid', fgColor='1F4E3D')
+    S = Font(name='Calibri', size=10, bold=True)
+    T = Font(name='Calibri', size=14, bold=True, color='1F4E3D')
+    B = Border(bottom=Side(style='thin', color='D0D0D0'))
+    MONEY = 'R$ #,##0.00'
+
+    def aba(ws, header, rows, widths, money=(), dates=()):
+        """Escreve a aba; com 'ocultar valores' as colunas de R$ (índices em `money`, base 1) nem entram."""
+        manter = [k for k in range(1, len(header) + 1) if not (ocultar and k in money)]
+        ws.append([header[k - 1] for k in manter])
+        for row in rows:
+            ws.append([row[k - 1] for k in manter])
+        m_new = [manter.index(k) + 1 for k in money if k in manter]
+        d_new = [manter.index(k) + 1 for k in dates if k in manter]
+        for c in ws[1]:
+            c.font, c.fill, c.alignment = H, HF, Alignment(vertical='center', wrap_text=True)
+        for row in ws.iter_rows(min_row=2):
+            for c in row:
+                c.font, c.border, c.alignment = F, B, Alignment(vertical='top', wrap_text=True)
+                if c.column in m_new:
+                    c.number_format = MONEY
+                if c.column in d_new:
+                    c.number_format = 'DD/MM/YYYY'
+        for i, k in enumerate(manter, 1):
+            ws.column_dimensions[get_column_letter(i)].width = widths[k - 1]
+        ws.freeze_panes = ws.cell(2, 1)
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(manter))}{max(ws.max_row, 1)}"
+        return manter
+
+    wb = Workbook()
+    w1 = wb.active
+    w1.title = 'Por equipamento'
+    rows1 = []
+    for e in eqs:
+        ds = ', '.join(v['dt'].strftime('%d/%m/%Y') for v in e['vs'])
+        nos = ', '.join(str(x['n']) for v in e['vs'] for x in v['ativos'])
+        rows1.append([e['tipo'], e['mod'], e['ser'], len(e['vs']), ds, nos,
+                      sum(x['val'] for v in e['vs'] for x in v['ativos']), sum(p['val'] for v in e['vs'] for p in v['peds'])])
+    manter1 = aba(w1, ['Equipamento', 'Modelo', 'Nº de série', 'Vezes em manutenção', 'Datas de entrada', 'Nº das OS',
+                       'Total serviços (R$)', 'Total peças (R$)'], rows1, [14, 9, 18, 12, 44, 30, 16, 16], money=(7, 8))
+    n = w1.max_row
+    w1.cell(n + 1, 3, 'Total').font = S
+    for col in (4, 7, 8):
+        if col in manter1:
+            L = get_column_letter(manter1.index(col) + 1)
+            c = w1.cell(n + 1, manter1.index(col) + 1, f'=SUM({L}2:{L}{n})')
+            c.font = S
+            if col > 4:
+                c.number_format = MONEY
+
+    w2 = wb.create_sheet('Histórico detalhado')
+    rows2 = []
+    for e in eqs:
+        for k, v in enumerate(e['vs'], 1):
+            txt, pc = _rm_o_que(v, ocultar)
+            defs = []
+            for x in v['rs']:
+                if x['defeito'] and x['defeito'] not in defs:
+                    defs.append(x['defeito'])
+            rows2.append([e['tipo'], e['mod'], e['ser'], f"{k}ª", v['dt'], ', '.join(str(x['n']) for x in v['ativos']),
+                          (' | '.join(defs)[:400] or '—'), txt, '; '.join(pc) if pc else '—',
+                          sum(x['val'] for x in v['ativos']), sum(p['val'] for p in v['peds']), _rm_situacao(v)])
+    aba(w2, ['Equipamento', 'Modelo', 'Nº de série', 'Entrada nº', 'Data de entrada', 'OS', 'Defeito relatado',
+             'O que foi feito (mão de obra / laudo)', 'Peças aplicadas', 'Serviços (R$)', 'Peças (R$)', 'Situação'],
+        rows2, [13, 8, 17, 8, 12, 12, 42, 60, 60, 13, 13, 24], money=(10, 11), dates=(5,))
+
+    w3 = wb.create_sheet('OS sem nº de série')
+    rows3 = [[r['n'], r['dt'], r['tipo'], (r['defeito'] or r['nome'])[:300], r['val'], 'Faturada' if r['fatd'] else 'Em aberto']
+             for r in sem_serie]
+    aba(w3, ['OS', 'Data', 'Tipo', 'Descrição', 'Valor (R$)', 'Situação'], rows3, [8, 12, 16, 90, 14, 14], money=(5,), dates=(2,))
+
+    w4 = wb.create_sheet('Pedidos sem equipamento')
+    rows4 = [[p['n'], p['dt'], 'Faturado' if p['et'] == '60' else 'Em aberto', p['val'],
+              '; '.join(f"{q:g}x {ds}" for q, ds, _ in p['its'][:4]) + (' ...' if len(p['its']) > 4 else '')] for p in nao_ligados]
+    manter4 = aba(w4, ['Pedido', 'Data', 'Situação', 'Valor (R$)', 'Itens (resumo)'], rows4, [9, 12, 11, 14, 100], money=(4,), dates=(2,))
+    if 4 in manter4 and nao_ligados:
+        w4.cell(w4.max_row + 1, 3, 'Total').font = S
+        c = w4.cell(w4.max_row, manter4.index(4) + 1, f'=SUM({get_column_letter(manter4.index(4) + 1)}2:{get_column_letter(manter4.index(4) + 1)}{w4.max_row - 1})')
+        c.number_format = MONEY
+
+    # notas de conferência (Leia-me)
+    todas_series = {s for r in recs for s in r['sers']}
+    pares = _rm_pares_parecidos(todas_series)
+    dobro = [(e['ser'], k, v) for e in eqs for k, v in enumerate(e['vs'], 1)
+             if len([p for p in v['peds'] if p['et'] == '60']) >= 2]
+    ligadas = [r for r in recs if r['via'] and not r['cancel']]
+    em_and = [(e['ser'], k) for e in eqs for k, v in enumerate(e['vs'], 1) if _rm_situacao(v).startswith('Em andamento')]
+    w0 = wb.create_sheet('Leia-me', 0)
+    ln = [f'Manutenções por equipamento — {cli_nome}',
+          f'Período: {de_txt} a {ate_txt} · Fonte: Omie · Emitido em {datetime.now().strftime("%d/%m/%Y")}'
+          + (' · valores ocultos' if ocultar else ''), '',
+          f'Equipamentos com nº de série atendidos: {len(eqs)}  ·  Entradas em manutenção: {n_ent}  ·  OS sem nº de série: {len(sem_serie)}', '',
+          'Como ler:',
+          '• "Entrada" = uma vez que o equipamento veio para manutenção. OS de laudo/análise e OS de faturamento do mesmo atendimento contam como UMA entrada; OS canceladas (refaturamento) não contam.',
+          '• "O que foi feito": mão de obra lançada na OS e, quando existe, os serviços descritos no laudo; "Peças aplicadas": itens dos pedidos de venda ligados ao equipamento.',
+          '• Peças são ligadas pelo nº da OS ou nº de série citado no pedido; pedidos sem essa referência estão na aba "Pedidos sem equipamento".',
+          '• Quando há OS de laudo (aguardando aprovação) e OS de faturamento do mesmo atendimento, só a faturada entra nos valores.',
+          '• O Omie não tem campo de nº de série: ele é lido do texto das OS (13 a 15 letras/números). Séries "4L..." são de controle remoto.',
+          '']
+    if pares:
+        ln.append('CONFERIR — possíveis erros de digitação no nº de série (diferem em 1 caractere; NÃO foram unificados):')
+        ln += [f'   • {a}  ×  {b}' for a, b in pares]
+        ln.append('')
+    if dobro:
+        ln.append('ALERTA — possível cobrança em dobro (mesma entrada com 2 ou mais pedidos faturados):')
+        ln += [f'   • série {s}, entrada {k}ª: pedidos ' + ', '.join(str(p['n']) for p in v['peds'] if p['et'] == '60') for s, k, v in dobro]
+        ln.append('')
+    if ligadas:
+        ln.append('OS sem série no texto ligadas a um equipamento por outra referência (conferir):')
+        ln += [f"   • OS {r['n']} → {r['ser']} (por {r['via']})" for r in ligadas]
+        ln.append('')
+    if em_and:
+        ln.append('Entradas em andamento (garantias, laudos sem aprovação) aparecem com a situação correspondente.')
+    for i, t in enumerate(ln, 1):
+        c = w0.cell(i, 1, t)
+        c.font = T if i == 1 else (S if t.endswith(':') and not t.startswith(' ') else F)
+        c.alignment = Alignment(wrap_text=True, vertical='top')
+    w0.column_dimensions['A'].width = 130
+    bio = io.BytesIO()
+    wb.save(bio)
+    resumo = {
+        "equipamentos": len(eqs), "entradas": n_ent, "osNoPeriodo": len(recs),
+        "semSerie": [r['n'] for r in sem_serie], "pedidosSemEquipamento": len(nao_ligados),
+        "possiveisDigitacao": [list(p) for p in pares],
+        "cobrancaEmDobro": [{"serie": s, "entrada": k} for s, k, _ in dobro],
+        "equipamentosLista": [{"tipo": e['tipo'], "modelo": e['mod'], "serie": e['ser'], "entradas": len(e['vs']),
+                               "datas": [v['dt'].strftime('%d/%m/%Y') for v in e['vs']]} for e in eqs],
+    }
+    return bio.getvalue(), resumo
+
+
+def _rm_omie_lista(endpoint, call, param, chave, job, rotulo):
+    """Lista paginada (100/pág) do Omie com pausa de ~0,5 s entre páginas (limite de taxa) e 2 repetições se o Omie engasgar."""
+    itens, p = [], 1
+    while True:
+        par = dict(param)
+        par['pagina'] = p
+        for tentativa in range(3):
+            try:
+                d = omie_call(endpoint, call, par, timeout=90)
+                break
+            except OmieNoRecords:
+                return itens
+            except OmieError as e:
+                if e.status == 429 or tentativa == 2:
+                    raise
+                time.sleep(4)
+        itens += d.get(chave) or []
+        tot = _rm_int(d.get('total_de_paginas'), 1) or 1
+        job['fase'] = f"{rotulo}: página {p} de {tot}"
+        if p >= tot:
+            return itens
+        p += 1
+        time.sleep(0.5)
+
+
+def _rm_job_thread(job_id, app_key, app_secret, cod_cli, cli_nome, de, ate, ocultar):
+    job = _RM_JOBS[job_id]
+    try:
+        with app.app_context():
+            g.omie_app_key, g.omie_app_secret = app_key, app_secret
+            chave = (cod_cli, de, ate)
+            hit = _RM_CACHE.get(chave)
+            if hit and time.time() - hit[0] < 1800:
+                os_cli, peds = hit[1], hit[2]
+                job['fase'] = 'usando os dados já lidos do Omie'
+            else:
+                os_all = _rm_omie_lista('/servicos/os/', 'ListarOS', {
+                    "registros_por_pagina": 100, "apenas_importado_api": "N",
+                    "filtrar_por_data_de": de, "filtrar_por_data_ate": ate}, 'osCadastro', job, 'Lendo as OS do período')
+                os_cli = [o for o in os_all if _rm_int((o.get('Cabecalho') or {}).get('nCodCli')) == cod_cli]
+                os_all = None
+                peds = _rm_omie_lista('/produtos/pedido/', 'ListarPedidos', {
+                    "registros_por_pagina": 100, "apenas_importado_api": "N", "filtrar_por_cliente": cod_cli,
+                    "filtrar_por_data_de": de, "filtrar_por_data_ate": ate}, 'pedido_venda_produto', job, 'Lendo os pedidos')
+                if len(_RM_CACHE) > 6:
+                    _RM_CACHE.clear()
+                _RM_CACHE[chave] = (time.time(), os_cli, peds)
+        job['fase'] = 'montando a planilha'
+        xl, resumo = _rm_montar(os_cli, peds, cli_nome, de, ate, ocultar)
+        slug = re.sub(r'[^A-Za-z0-9]+', '_', cli_nome).strip('_')[:40] or 'cliente'
+        job.update(state='ok', fase='pronto', xlsx=xl, resumo=resumo,
+                   arquivo=f"Manutencoes_por_Equipamento_{slug}_{de.replace('/', '-')}_a_{ate.replace('/', '-')}{'_sem_valores' if ocultar else ''}.xlsx")
+    except OmieError as e:
+        job.update(state='erro', erro=str(e)[:300])
+    except Exception as e:
+        print(f"[REL-MANUT] erro: {type(e).__name__}: {e}", flush=True)
+        job.update(state='erro', erro=f"{type(e).__name__}: {e}"[:300])
+
+
+def _rm_require():
+    full_data = load_data()
+    user = _resolve_token(full_data, request.headers.get('Authorization'))
+    u = (full_data.get('users') or {}).get(user) if user else None
+    if not u or u.get('status') != 'active' or u.get('role') not in ('admin', 'admin_master'):
+        return None, None, (jsonify({"error": "Não autorizado"}), 401)
+    _set_omie_context(full_data, user)
+    return user, full_data, None
+
+
+@app.route('/api/relatorio-manutencao', methods=['POST'])
+def rm_iniciar():
+    """Começa a gerar o relatório em segundo plano e responde na hora com o id do trabalho."""
+    user, full_data, err = _rm_require()
+    if err:
+        return err
+    b = request.json or {}
+    cod = _rm_int(b.get('clienteId'))
+    nome = (b.get('clienteNome') or '').strip()[:120] or 'Cliente'
+    try:
+        d1 = datetime.strptime(str(b.get('de') or ''), '%Y-%m-%d')
+        d2 = datetime.strptime(str(b.get('ate') or ''), '%Y-%m-%d')
+    except ValueError:
+        return jsonify({"error": "Informe a data inicial e a final."}), 400
+    if not cod:
+        return jsonify({"error": "Escolha o cliente na lista."}), 400
+    if d2 < d1:
+        return jsonify({"error": "A data final é anterior à inicial."}), 400
+    if (d2 - d1).days > 800:
+        return jsonify({"error": "Período grande demais (máximo ~2 anos)."}), 400
+    app_key = getattr(g, 'omie_app_key', None) or os.environ.get("OMIE_APP_KEY")
+    app_secret = getattr(g, 'omie_app_secret', None) or os.environ.get("OMIE_APP_SECRET")
+    if not app_key or not app_secret:
+        return jsonify({"error": "Credenciais Omie não configuradas para esta filial."}), 503
+    with _RM_JOBS_LOCK:
+        agora = time.time()
+        for k in [k for k, j in _RM_JOBS.items() if agora - j.get('criado', 0) > 3600]:
+            _RM_JOBS.pop(k, None)
+        andando = next((k for k, j in _RM_JOBS.items() if j.get('state') == 'gerando'), None)
+        if andando:
+            return jsonify({"error": "Já há um relatório sendo gerado. Aguarde terminar.", "jobId": andando}), 409
+        jid = secrets.token_hex(8)
+        _RM_JOBS[jid] = {"state": "gerando", "fase": "começando", "criado": agora, "user": user}
+    threading.Thread(target=_rm_job_thread, daemon=True, args=(
+        jid, app_key, app_secret, cod, nome, d1.strftime('%d/%m/%Y'), d2.strftime('%d/%m/%Y'), bool(b.get('ocultarValores')))).start()
+    return jsonify({"success": True, "jobId": jid})
+
+
+@app.route('/api/relatorio-manutencao/<jid>/status', methods=['GET'])
+def rm_status(jid):
+    user, full_data, err = _rm_require()
+    if err:
+        return err
+    j = _RM_JOBS.get(jid)
+    if not j:
+        return jsonify({"state": "nenhum"})
+    out = {k: j.get(k) for k in ('state', 'fase', 'erro', 'arquivo')}
+    if j.get('state') == 'ok':
+        r = j.get('resumo') or {}
+        out['resumo'] = {k: r.get(k) for k in ('equipamentos', 'entradas', 'osNoPeriodo', 'semSerie', 'pedidosSemEquipamento',
+                                               'possiveisDigitacao', 'cobrancaEmDobro', 'equipamentosLista')}
+    return jsonify(out)
+
+
+@app.route('/api/relatorio-manutencao/<jid>/arquivo', methods=['GET'])
+def rm_arquivo(jid):
+    user, full_data, err = _rm_require()
+    if err:
+        return err
+    j = _RM_JOBS.get(jid)
+    if not j or j.get('state') != 'ok':
+        return jsonify({"error": "Relatório não está pronto."}), 404
+    resp = Response(j['xlsx'], mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    resp.headers['Content-Disposition'] = 'attachment; filename="' + (j.get('arquivo') or 'relatorio.xlsx') + '"'
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+_MIDIA_JOBS = {}   # "<os_id>:<mid>" -> estado do envio ao Omie (em memória): enviando/ok/erro + bytes enviados
+_MIDIA_JOBS_LOCK = threading.Lock()
+
+
+def _omie_post_com_progresso(endpoint, call, param, app_key, app_secret, job):
+    """POST ao Omie em blocos, contando os bytes enviados (alimenta a barra de progresso). Lança OmieError."""
+    import http.client
+    from urllib.parse import urlparse
+    _omie_bloqueio_checar()
+    u = urlparse(OMIE_BASE + endpoint)
+    corpo = json.dumps({"call": call, "app_key": app_key, "app_secret": app_secret, "param": [param]}).encode('utf-8')
+    job['total'] = len(corpo)
+    job['sent'] = 0
+    conn = http.client.HTTPSConnection(u.netloc, timeout=600)
+    try:
+        conn.putrequest('POST', u.path)
+        conn.putheader('Content-Type', 'application/json')
+        conn.putheader('Content-Length', str(len(corpo)))
+        conn.endheaders()
+        for i in range(0, len(corpo), 65536):
+            conn.send(corpo[i:i + 65536])
+            job['sent'] = min(i + 65536, len(corpo))
+        job['fase'] = 'omie'      # tudo enviado; aguardando o Omie processar
+        resp = conn.getresponse()
+        raw = resp.read().decode('utf-8', 'replace')
+        if resp.status >= 400:
+            try:
+                j = json.loads(raw)
+                msg = j.get('faultstring') or j.get('faultcode') or raw
+            except Exception:
+                msg = f"HTTP {resp.status}"
+            _omie_bloqueio_registrar(msg)
+            raise OmieError(f"Omie: {msg}", status=502)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise OmieError("Resposta inválida do Omie", status=502)
+    except (TimeoutError, OSError) as e:
+        raise OmieError(f"Tempo esgotado ou conexão caiu falando com o Omie ({type(e).__name__}).", status=504)
+    finally:
+        conn.close()
+
+
+def _midia_job_thread(chave, caminho, nome, ext, omie_os_id, tag, app_key, app_secret):
+    job = _MIDIA_JOBS[chave]
+    try:
+        job['fase'] = 'preparando'
+        zb = io.BytesIO()
+        with zipfile.ZipFile(zb, 'w', zipfile.ZIP_STORED) as zf:   # vídeo/foto já é comprimido: só empacota
+            zf.write(caminho, nome)
+        b64 = base64.b64encode(zb.getvalue()).decode('ascii')
+        zb = None
+        md5h = hashlib.md5(b64.encode('ascii')).hexdigest()
+        print(f"[MIDIA-OMIE] {nome} b64={len(b64)//1024}KB", flush=True)
+        job['fase'] = 'enviando'
+        _omie_post_com_progresso('/geral/anexo/', 'IncluirAnexo', {
+            "cCodIntAnexo": (tag + "_" + str(omie_os_id))[:20], "cTabela": "ordem-servico", "nId": omie_os_id,
+            "cNomeArquivo": (os.path.splitext(nome)[0] + ".zip"), "cTipoArquivo": "zip", "cArquivo": b64, "cMd5": md5h}, app_key, app_secret, job)
+        job['state'] = 'ok'
+    except OmieError as e:
+        job['state'] = 'erro'
+        job['erro'] = str(e)[:300]
+    except Exception as e:
+        job['state'] = 'erro'
+        job['erro'] = f"{type(e).__name__}: {e}"[:300]
+
+
+@app.route('/api/os/<os_id>/teste-midia/<mid>/omie', methods=['POST'])
+def os_teste_midia_para_omie(os_id, mid):
+    """Começa o envio de UM vídeo/foto do teste para os Anexos da OS no Omie. Roda em segundo plano (não trava o Smart
+    para os outros) e responde na hora; a tela acompanha pelo GET .../omie/status (barra de progresso)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    owner, draft = _find_filial_draft(full_data, user, os_id)
+    if not draft:
+        return jsonify({"error": "OS não encontrada"}), 404
+    lista = draft.get('testeMidias') or []
+    m = next((x for x in lista if x.get('id') == mid), None)
+    if not m:
+        return jsonify({"error": "Anexo não encontrado"}), 404
+    if not draft.get('omieOsId'):
+        return jsonify({"error": "Esta OS ainda não existe no Omie."}), 400
+    if (m.get('omie') or {}).get('ok') and request.args.get('forcar') != '1':
+        return jsonify({"success": True, "ja": True, "midia": m})
+    caminho = os.path.join(_midia_pasta(os_id), f"{_safe_name(mid)}.{_safe_name(m.get('ext') or '')}")
+    if not os.path.isfile(caminho):
+        return jsonify({"error": "Arquivo não encontrado no servidor"}), 404
+    app_key = getattr(g, 'omie_app_key', None) or os.environ.get("OMIE_APP_KEY")
+    app_secret = getattr(g, 'omie_app_secret', None) or os.environ.get("OMIE_APP_SECRET")
+    if not app_key or not app_secret:
+        return jsonify({"error": "Credenciais Omie não configuradas para esta filial."}), 503
+    if os.environ.get("OMIE_SOMENTE_LEITURA") == "1":
+        return jsonify({"error": "Servidor de teste: gravação no Omie bloqueada."}), 403
+    chave = f"{os_id}:{mid}"
+    with _MIDIA_JOBS_LOCK:
+        atual = _MIDIA_JOBS.get(chave)
+        if atual and atual.get('state') == 'enviando':
+            return jsonify({"success": True, "iniciado": True, "ja_enviando": True})
+        ext = (m.get('ext') or 'mp4').lower()
+        idx = 1 + [x.get('id') for x in lista].index(mid)
+        osnum = str(draft.get('omieOsNumber') or os_id)
+        nome = re.sub(r'[^A-Za-z0-9_-]', '_', f"{'video' if m.get('tipo') == 'video' else 'foto'}_teste_OS_{osnum}_{idx:02d}") + f".{ext}"
+        _MIDIA_JOBS[chave] = {"state": "enviando", "fase": "preparando", "sent": 0, "total": 0, "nome": nome, "aplicado": False}
+    threading.Thread(target=_midia_job_thread, daemon=True,
+                     args=(chave, caminho, nome, ext, draft['omieOsId'], "mv" + secrets.token_hex(4), app_key, app_secret)).start()
+    return jsonify({"success": True, "iniciado": True})
+
+
+@app.route('/api/os/<os_id>/teste-midia/<mid>/omie/status', methods=['GET'])
+def os_teste_midia_para_omie_status(os_id, mid):
+    """Andamento do envio (para a barra). Quando termina, grava o resultado no vídeo (uma única vez)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    job = _MIDIA_JOBS.get(f"{os_id}:{mid}")
+    if not job:
+        return jsonify({"state": "nenhum"})
+    out = {k: job.get(k) for k in ('state', 'fase', 'sent', 'total', 'erro')}
+    if job['state'] in ('ok', 'erro') and not job.get('aplicado'):
+        owner, draft = _find_filial_draft(full_data, user, os_id)
+        m = next((x for x in (draft or {}).get('testeMidias') or [] if x.get('id') == mid), None)
+        if m:
+            agora = datetime.utcnow().isoformat() + "Z"
+            m['omie'] = ({"ok": True, "nome": job.get('nome'), "em": agora} if job['state'] == 'ok'
+                         else {"ok": False, "erro": job.get('erro') or 'falha', "em": agora})
+            save_data(full_data)
+            job['aplicado'] = True
+    return jsonify(out)
+
+
 @app.route('/api/os/<os_id>/teste-midia/<mid>', methods=['DELETE'])
 def os_teste_midia_excluir(os_id, mid):
     """Quem anexou, ou o administrador, pode excluir."""
@@ -4775,6 +5456,120 @@ Escreva o laudo completo seguindo a estrutura acima, em texto puro (sem markdown
             return jsonify({"error": f"Falha de conexão com Gemini: {e.reason}"}), 502
 
     return jsonify({"error": f"Gemini: todos os modelos falharam. Último erro: {ultimo_erro}"}), 502
+
+
+@app.route('/api/ler-celulas-foto', methods=['POST'])
+def ler_celulas_foto():
+    """Lê, por IA (Gemini visão), as tensões por célula mostradas na tela da máquina de equalização.
+    Entrada: {imageBase64: 'data:image/...;base64,...', numCells: 14}. Saída: {celulas: ['3.912', '', ...], dudosas: [idx...]}.
+    Só devolve valores — quem confere e confirma é o técnico na tela (campos continuam editáveis)."""
+    user, full_data, err = _require_user()
+    if err:
+        return err
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return jsonify({"error": "GEMINI_API_KEY não configurada no servidor."}), 503
+
+    body = request.json or {}
+    img = body.get('imageBase64') or ''
+    try:
+        num_cells = max(1, min(int(body.get('numCells') or 14), 60))
+    except (TypeError, ValueError):
+        num_cells = 14
+    m = re.match(r'^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$', img, re.S)
+    if not m:
+        return jsonify({"error": "Imagem inválida."}), 400
+    mime, b64 = m.group(1), m.group(2)
+    if len(b64) > 12 * 1024 * 1024:
+        return jsonify({"error": "Imagem muito grande."}), 413
+
+    prompt = (
+        "A imagem é uma FOTO da tela de uma máquina de equalização/balanceamento de baterias de drone. "
+        f"A bateria tem {num_cells} células. Leia a TENSÃO de cada célula mostrada na tela, na ordem numérica das células "
+        "(célula 1, 2, 3, ...). A tela pode mostrar os valores em V (ex.: 3.912) ou em mV (ex.: 3912).\n"
+        "Responda SOMENTE com JSON no formato: "
+        '{"unidade":"V" ou "mV","celulas":[{"n":1,"v":3.912}, ...],"media":3.847,"drop":0.013,"strings":14,"obs":"texto curto ou vazio"}.\n'
+        "A tela tem até 24 campos numerados em 3 colunas; campos sem célula mostram traços (------): NÃO os inclua. "
+        "Em \"media\", \"drop\" e \"strings\" copie os valores que a própria máquina exibe nos quadros 'Average voltage', "
+        "'voltage Drop' e 'Number of strings' (null se não aparecerem).\n"
+        "Regras: use o número da célula como aparece na tela; se um valor estiver ilegível, cortado, com reflexo ou você não tiver "
+        "certeza, coloque null em \"v\" (NUNCA chute); não some, não calcule média, não inclua tensão total nem delta/diferença — "
+        "apenas as tensões individuais das células; ignore células que não existam na tela. Se a imagem não for uma tela de "
+        "equalizador com tensões de células, responda {\"unidade\":\"V\",\"celulas\":[],\"obs\":\"imagem sem tensões de células\"}."
+    )
+    env_model = os.environ.get('GEMINI_MODEL')
+    modelos = [env_model] if env_model else ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest']
+    erro = ''
+    resultado = None
+    for modelo in modelos:
+        gen = {"temperature": 0, "maxOutputTokens": 2000, "responseMimeType": "application/json"}
+        if '2.5' in modelo:
+            gen["thinkingConfig"] = {"thinkingBudget": 0}
+        payload = json.dumps({"contents": [{"parts": [{"text": prompt}, {"inlineData": {"mimeType": mime, "data": b64}}]}],
+                              "generationConfig": gen}).encode('utf-8')
+        req = urlreq.Request(f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}",
+                             data=payload, headers={'Content-Type': 'application/json'})
+        try:
+            with urlreq.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            texto = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            texto = re.sub(r'^```(?:json)?|```$', '', texto, flags=re.M).strip()
+            resultado = json.loads(texto)
+            break
+        except HTTPError as e:
+            erro = f"HTTP {e.code} ({modelo})"
+        except Exception as e:
+            erro = f"{type(e).__name__} ({modelo})"
+    if not isinstance(resultado, dict):
+        return jsonify({"error": f"Não consegui ler a foto agora ({erro or 'resposta fora do formato'}). Digite manualmente ou tente de novo."}), 502
+
+    # Normaliza: mV -> V, descarta valores fora de uma faixa plausível de célula Li (1.5 a 4.8 V)
+    lidas = {}
+    for c in (resultado.get('celulas') or []):
+        try:
+            n = int(c.get('n'))
+            v = c.get('v')
+            if v is None:
+                continue
+            v = float(str(v).replace(',', '.'))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if v > 10:           # veio em mV
+            v = v / 1000.0
+        if 1.5 <= v <= 4.8 and 1 <= n <= num_cells:
+            lidas.setdefault(n, v)
+    celulas = [f"{lidas[i]:.3f}" if i in lidas else '' for i in range(1, num_cells + 1)]
+    faltando = [i for i in range(num_cells) if not celulas[i]]
+
+    # Conferência cruzada com o que a própria máquina mostra (média, drop, nº de strings)
+    avisos = []
+    vals = list(lidas.values())
+    def _num(x):
+        try:
+            return float(str(x).replace(',', '.'))
+        except (TypeError, ValueError):
+            return None
+    m_maq, d_maq, s_maq = _num(resultado.get('media')), _num(resultado.get('drop')), _num(resultado.get('strings'))
+    conferido = None
+    if vals and not faltando:
+        ok = True
+        if m_maq is not None and abs(sum(vals) / len(vals) - m_maq) > 0.0025:
+            ok = False
+            avisos.append(f"A média lida ({sum(vals)/len(vals):.3f}) difere da média da máquina ({m_maq:.3f}).")
+        if d_maq is not None and abs((max(vals) - min(vals)) - d_maq) > 0.0025:
+            ok = False
+            avisos.append(f"O drop lido ({max(vals)-min(vals):.3f}) difere do drop da máquina ({d_maq:.3f}).")
+        if m_maq is None and d_maq is None:
+            ok = None
+        conferido = ok
+    if s_maq is not None and int(s_maq) != num_cells:
+        avisos.append(f"A máquina mostra {int(s_maq)} strings, mas o modelo espera {num_cells} células.")
+    if faltando:
+        avisos.append(f"{len(faltando)} célula(s) não foram lidas: " + ", ".join(str(i + 1) for i in faltando) + ".")
+    return jsonify({
+        "celulas": celulas, "faltando": faltando, "lidas": len(lidas), "esperadas": num_cells,
+        "conferido": conferido, "avisos": avisos, "obs": str(resultado.get('obs') or '')[:200],
+    })
 
 
 def _orcamento_story(osq, page_break=True, titulo="Ordem de Serviço / Orçamento"):
@@ -6406,7 +7201,7 @@ HTML_PAGE = """
 
         // Um anexo do teste. A foto carrega sozinha (miniatura); o vídeo só quando a pessoa clica em "Ver vídeo" (pode ter 50 MB).
         // Buscamos o arquivo com o cabeçalho de login e mostramos por um endereço temporário: o token não vai na URL.
-        const MidiaItem = ({ osId, m, token, podeExcluir, onExcluir }) => {
+        const MidiaItem = ({ osId, m, token, podeExcluir, onExcluir, onOmie, prog }) => {
             const [url, setUrl] = useState(null);
             const [carregando, setCarregando] = useState(false);
             const [erro, setErro] = useState('');
@@ -6442,6 +7237,13 @@ HTML_PAGE = """
                         <div className="min-w-0">
                             <div className="truncate text-slate-700 font-medium">${m.legenda || m.nome}</div>
                             <div className="truncate">${m.porNome || m.por} · ${quando}</div>
+                            ${prog ? html`
+                                <div className="mt-1">
+                                    <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden"><div className="h-2 bg-orange-500 transition-all" style=${{ width: (prog.fase === 'omie' ? 100 : prog.pct) + '%' }}></div></div>
+                                    <div className="text-orange-600 font-medium">${prog.fase === 'preparando' ? 'Preparando o arquivo…' : prog.fase === 'omie' ? 'Enviado. Aguardando o Omie confirmar…' : 'Enviando ao Omie… ' + prog.pct + '%'}</div>
+                                </div>` : m.tipo === 'video' ? (m.omie && m.omie.ok
+                                ? html`<div className="text-emerald-600 font-medium"><i className="ph-bold ph-check-circle"></i> Anexado na OS do Omie</div>`
+                                : html`<div className="text-orange-600 font-medium">${m.omie && m.omie.erro ? 'Omie recusou. ' : 'Ainda não está no Omie. '}${onOmie ? html`<button onClick=${() => onOmie(m)} className="underline hover:text-orange-800">Reenviar ao Omie</button>` : ''}</div>`) : ''}
                         </div>
                         ${podeExcluir ? html`<button onClick=${() => onExcluir(m)} title="Excluir este anexo" className="text-red-400 hover:text-red-600 p-1"><i className="ph-bold ph-trash"></i></button>` : ''}
                     </div>
@@ -6504,6 +7306,18 @@ HTML_PAGE = """
             const [requisicoes, setRequisicoes] = useState(null);   // null = ainda não carregou
             const [reqAlmox, setReqAlmox] = useState(false);        // este usuário atende requisições?
             const [reqLoading, setReqLoading] = useState(false);
+            const [reqSilencio, setReqSilencio] = useState(0);        // até quando o bipe fica silenciado (timestamp)
+            const [reqOverlayVisto, setReqOverlayVisto] = useState(''); // ids pendentes já vistos na tela sobreposta
+            // Relatório de manutenções por equipamento (admin / admin_master)
+            const [rmQ, setRmQ] = useState('');
+            const [rmRes, setRmRes] = useState([]);
+            const [rmBusy, setRmBusy] = useState(false);
+            const [rmCli, setRmCli] = useState(null);
+            const [rmDe, setRmDe] = useState('');
+            const [rmAte, setRmAte] = useState('');
+            const [rmOcultar, setRmOcultar] = useState(false);
+            const [rmJob, setRmJob] = useState(null);
+            const [rmMsg, setRmMsg] = useState('');
             const [reqFiltro, setReqFiltro] = useState('abertas');  // abertas | concluidas | todas
             const [reqTexto, setReqTexto] = useState('');
             const [reqForm, setReqForm] = useState(null);           // null = formulário fechado
@@ -6528,6 +7342,7 @@ HTML_PAGE = """
             const [reportImages, setReportImages] = useState([]);
             const [pdfMargin, setPdfMargin] = useState('1.5cm');
             const [cellVoltages, setCellVoltages] = useState({}); // { modelId: ["3.85", "3.86", ...] }
+            const [celFoto, setCelFoto] = useState({ loading: false, msg: '', tipo: '' }); // leitura da foto da equalizadora
             const [motorResistances, setMotorResistances] = useState({}); // { modelId: ["0.120", "0.118", ...] }
             const [laudosList, setLaudosList] = useState([]);
             const [laudosModalOpen, setLaudosModalOpen] = useState(false);
@@ -6576,6 +7391,7 @@ HTML_PAGE = """
             const [testeAbertaId, setTesteAbertaId] = useState(null);
             const [testeMotivo, setTesteMotivo] = useState('');
             const [midiaEnviando, setMidiaEnviando] = useState(null);   // id da OS que está recebendo anexos
+            const [midiaProg, setMidiaProg] = useState({});   // { idDaMidia: { pct, fase } } envio ao Omie em andamento
             const [testeReprovando, setTesteReprovando] = useState(false);
             const [testeCondenando, setTesteCondenando] = useState(false);
             const [testeLiberando, setTesteLiberando] = useState(false);
@@ -6880,9 +7696,105 @@ HTML_PAGE = """
                 if (!auth) return;
                 fetchRequisicoes();
                 if (activeTab === 'requisicoes' && (!osDrafts || osDrafts.length === 0)) fetchOsDrafts();
-                const id = setInterval(fetchRequisicoes, activeTab === 'requisicoes' ? 20000 : 90000);
+                const id = setInterval(fetchRequisicoes, (activeTab === 'requisicoes' || reqAlmox) ? 20000 : 90000);
                 return () => clearInterval(id);
-            }, [activeTab, auth]);
+            }, [activeTab, auth, reqAlmox]);
+
+            // ---- Relatório de manutenções por equipamento ----
+            const rmBuscar = async () => {
+                const q = rmQ.trim();
+                if (q.length < 3) { setRmMsg('Digite ao menos 3 letras do nome do cliente.'); return; }
+                setRmBusy(true); setRmMsg(''); setRmRes([]);
+                try {
+                    const r = await fetch('/api/omie/clientes?q=' + encodeURIComponent(q), { headers: { 'Authorization': auth.token } });
+                    const d = await r.json();
+                    if (!r.ok) setRmMsg(d.error || 'Erro ao buscar o cliente.');
+                    else { setRmRes(d.items || []); if (!(d.items || []).length) setRmMsg('Nenhum cliente encontrado. Tente o início do nome, ou use % como curinga (ex.: %FERNANDO%).'); }
+                } catch (e) { setRmMsg('Erro de conexão'); }
+                setRmBusy(false);
+            };
+            const rmGerar = async () => {
+                if (!rmCli) { setRmMsg('Escolha o cliente na lista.'); return; }
+                if (!rmDe || !rmAte) { setRmMsg('Informe a data inicial e a final.'); return; }
+                setRmMsg('');
+                try {
+                    const r = await fetch('/api/relatorio-manutencao', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ clienteId: rmCli.id, clienteNome: rmCli.name, de: rmDe, ate: rmAte, ocultarValores: rmOcultar }) });
+                    const d = await r.json();
+                    if (!r.ok) { setRmMsg(d.error || 'Erro ao gerar'); if (d.jobId) setRmJob({ id: d.jobId, state: 'gerando', fase: 'em andamento' }); return; }
+                    setRmJob({ id: d.jobId, state: 'gerando', fase: 'começando' });
+                } catch (e) { setRmMsg('Erro de conexão'); }
+            };
+            const rmBaixar = async () => {
+                try {
+                    const r = await fetch('/api/relatorio-manutencao/' + rmJob.id + '/arquivo', { headers: { 'Authorization': auth.token } });
+                    if (!r.ok) { setRmMsg('Não foi possível baixar o arquivo.'); return; }
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = rmJob.arquivo || 'relatorio.xlsx';
+                    document.body.appendChild(a); a.click(); a.remove();
+                    setTimeout(() => URL.revokeObjectURL(url), 5000);
+                } catch (e) { setRmMsg('Erro de conexão ao baixar.'); }
+            };
+            useEffect(() => {
+                if (!auth || !rmJob || rmJob.state !== 'gerando') return;
+                const id = setInterval(async () => {
+                    try {
+                        const d = await fetch('/api/relatorio-manutencao/' + rmJob.id + '/status', { headers: { 'Authorization': auth.token } }).then(r => r.json());
+                        if (!d || !d.state) return;
+                        if (d.state === 'nenhum') setRmJob({ id: rmJob.id, state: 'erro', erro: 'O servidor foi reiniciado durante a geração. Gere de novo.' });
+                        else if (d.state !== 'gerando') setRmJob({ id: rmJob.id, ...d });
+                        else setRmJob(j => (j && j.id === rmJob.id) ? { ...j, fase: d.fase } : j);
+                    } catch (e) {}
+                }, 2000);
+                return () => clearInterval(id);
+            }, [auth, rmJob && rmJob.id, rmJob && rmJob.state]);
+
+            // ---- Alerta de requisição pendente (só para o almoxarife): bipe repetido até atender + tela sobreposta ----
+            // "Atender" = a requisição sair de 'pendente' (iniciar separação, recusar ou cancelar).
+            const reqPend = reqAlmox ? (requisicoes || []).filter(r => r.status === 'pendente') : [];
+            const reqPendKey = reqPend.map(r => r.id).join(',');
+            const reqPendQtd = reqPend.length;
+            // Navegadores só liberam som depois de um toque/tecla do usuário: qualquer clique na página destrava.
+            useEffect(() => {
+                const destravar = () => {
+                    try {
+                        const AC = window.AudioContext || window.webkitAudioContext;
+                        if (!AC) return;
+                        window.__reqCtx = window.__reqCtx || new AC();
+                        if (window.__reqCtx.state === 'suspended') window.__reqCtx.resume();
+                    } catch (e) {}
+                };
+                document.addEventListener('pointerdown', destravar);
+                document.addEventListener('keydown', destravar);
+                return () => { document.removeEventListener('pointerdown', destravar); document.removeEventListener('keydown', destravar); };
+            }, []);
+            useEffect(() => {
+                if (!auth || !reqAlmox || reqPendQtd === 0) return;
+                window.__tituloOrig = window.__tituloOrig || document.title;
+                const orig = window.__tituloOrig;
+                const bipe = () => {
+                    if (Date.now() < reqSilencio) return;
+                    try {
+                        const ctx = window.__reqCtx;
+                        if (!ctx) return;
+                        if (ctx.state === 'suspended') ctx.resume();
+                        if (ctx.state !== 'running') return;
+                        [0, 0.28, 0.56].forEach(d => {
+                            const o = ctx.createOscillator(), g = ctx.createGain();
+                            o.type = 'square'; o.frequency.value = 880; g.gain.value = 0.15;
+                            o.connect(g); g.connect(ctx.destination);
+                            o.start(ctx.currentTime + d); o.stop(ctx.currentTime + d + 0.16);
+                        });
+                    } catch (e) {}
+                };
+                bipe();
+                const idB = setInterval(bipe, 15000);
+                let alt = false;
+                const idT = setInterval(() => { alt = !alt; document.title = alt ? ('(' + reqPendQtd + ') REQUISIÇÃO PENDENTE') : orig; }, 1000);
+                return () => { clearInterval(idB); clearInterval(idT); document.title = orig; };
+            }, [auth, reqAlmox, reqPendKey, reqSilencio]);
             // Autocomplete de peças (catálogo Omie) no formulário de requisição
             useEffect(() => {
                 if (reqBusca.idx === null || reqBusca.idx === undefined) return;
@@ -8084,6 +8996,37 @@ HTML_PAGE = """
                 img.src = dataUrl;
             });
 
+            // ---- Análise de células: preenche pela foto da tela da equalizadora (IA) ----
+            const lerCelulasDaFoto = async (file, modelKey, numCells) => {
+                if (!file) return;
+                setCelFoto({ loading: true, msg: 'Lendo a foto...', tipo: 'info' });
+                try {
+                    const dataUrl = await new Promise((res, rej) => {
+                        const fr = new FileReader();
+                        fr.onload = () => res(fr.result);
+                        fr.onerror = rej;
+                        fr.readAsDataURL(file);
+                    });
+                    const img = await compressImage(dataUrl, 1600);
+                    const resp = await fetch('/api/ler-celulas-foto', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': auth.token },
+                        body: JSON.stringify({ imageBase64: img, numCells })
+                    });
+                    const d = await resp.json();
+                    if (!resp.ok) { setCelFoto({ loading: false, msg: d.error || 'Falha ao ler a foto.', tipo: 'erro' }); return; }
+                    if (!d.lidas) { setCelFoto({ loading: false, msg: 'Não encontrei tensões de células nessa foto. Tente de novo, mais de frente e sem reflexo.', tipo: 'erro' }); return; }
+                    setCellVoltages(prev => ({ ...prev, [modelKey]: d.celulas }));
+                    const partes = [d.lidas + ' de ' + d.esperadas + ' células preenchidas.'];
+                    if (d.conferido === true) partes.push('Conferido com a média e o drop da máquina.');
+                    (d.avisos || []).forEach(a => partes.push(a));
+                    partes.push('Confira antes de continuar.');
+                    setCelFoto({ loading: false, msg: partes.join(' '), tipo: (d.conferido === false || d.faltando.length) ? 'aviso' : 'ok' });
+                } catch (e) {
+                    setCelFoto({ loading: false, msg: 'Erro ao enviar a foto. Digite manualmente ou tente de novo.', tipo: 'erro' });
+                }
+            };
+
             // ---- Histórico de Laudos ----
             const saveLaudo = async (name) => {
                 // Comprime as imagens novamente pra ficar leve no histórico
@@ -8779,7 +9722,15 @@ HTML_PAGE = """
                                 <h2 className="text-xl font-semibold mb-1 text-slate-800 flex items-center gap-2">
                                     <i className="ph-fill ph-lightning text-yellow-500 text-2xl"></i> Análise de Células
                                 </h2>
-                                <p className="text-sm text-slate-500 mb-4">Informe a tensão individual de cada célula. Pressione Enter para avançar.</p>
+                                <p className="text-sm text-slate-500 mb-3">Informe a tensão individual de cada célula (Enter avança) ou tire uma foto da tela da equalizadora.</p>
+                                <div className="mb-4">
+                                    <label className=${'inline-flex items-center gap-2 text-sm px-3 py-2 rounded-lg font-medium cursor-pointer ' + (celFoto.loading ? 'bg-slate-200 text-slate-500' : 'bg-yellow-50 text-yellow-800 hover:bg-yellow-100 border border-yellow-300')}>
+                                        <i className="ph-bold ph-camera"></i> ${celFoto.loading ? 'Lendo a foto...' : 'Ler da foto da equalizadora'}
+                                        <input type="file" accept="image/*" capture="environment" className="hidden" disabled=${celFoto.loading}
+                                            onChange=${e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; lerCelulasDaFoto(f, selectedModel.id, selectedModel.cellAnalysis.numCells || 14); }} />
+                                    </label>
+                                    ${celFoto.msg && html`<p className=${'text-sm mt-2 ' + (celFoto.tipo === 'ok' ? 'text-emerald-700' : celFoto.tipo === 'aviso' ? 'text-orange-600' : celFoto.tipo === 'erro' ? 'text-red-600' : 'text-slate-500')}>${celFoto.msg}</p>`}
+                                </div>
                                 ${(() => {
                                     const ca = selectedModel.cellAnalysis;
                                     const numCells = ca.numCells || 14;
@@ -9029,6 +9980,52 @@ HTML_PAGE = """
                         </div>
                     </div>
                 `;
+            };
+
+            const renderRelManut = () => {
+                const j = rmJob;
+                const gerando = j && j.state === 'gerando';
+                return html`
+                    <div className="space-y-5 animate-in fade-in duration-300 max-w-3xl">
+                        <div className="bg-white p-4 rounded-xl border border-slate-200">
+                            <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><i className="ph-fill ph-file-xls text-emerald-600 text-2xl"></i> Relatório de manutenções por equipamento</h2>
+                            <p className="text-sm text-slate-500 mt-1">Escolha o cliente e o período; o Smart lê as OS e os pedidos no Omie (somente leitura) e gera uma planilha Excel com cada equipamento, quantas vezes entrou, o que foi feito e as peças.</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl border border-slate-200 space-y-4">
+                            <div>
+                                <label className="block text-xs font-medium text-slate-600 mb-1">Cliente</label>
+                                ${rmCli ? html`
+                                    <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded px-3 py-2 text-sm">
+                                        <i className="ph-fill ph-check-circle text-emerald-600"></i><b className="flex-1">${rmCli.name}</b>
+                                        <button onClick=${() => { setRmCli(null); setRmRes([]); }} className="text-xs text-slate-500 underline">trocar</button>
+                                    </div>` : html`
+                                    <div className="flex gap-2">
+                                        <input type="text" value=${rmQ} onChange=${e => setRmQ(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter') rmBuscar(); }} placeholder="Nome do cliente (início da razão social)" className="flex-1 p-2 border border-slate-300 rounded text-sm" />
+                                        <button onClick=${rmBuscar} disabled=${rmBusy} className="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded text-sm font-medium">${rmBusy ? 'Buscando...' : 'Buscar'}</button>
+                                    </div>
+                                    ${rmRes.length > 0 && html`
+                                        <div className="mt-2 border border-slate-200 rounded max-h-56 overflow-y-auto divide-y">
+                                            ${rmRes.map(c => html`<button key=${c.id} onClick=${() => { setRmCli({ id: c.id, name: c.name }); setRmRes([]); setRmMsg(''); }} className="block w-full text-left px-3 py-2 text-sm hover:bg-slate-50">${c.name}${c.fantasia && c.fantasia !== c.name ? html` <span className="text-slate-400">(${c.fantasia})</span>` : ''}${c.document ? html` <span className="text-slate-400 text-xs">· ${c.document}</span>` : ''}</button>`)}
+                                        </div>`}`}
+                            </div>
+                            <div className="flex gap-3 flex-wrap items-end">
+                                <div><label className="block text-xs font-medium text-slate-600 mb-1">Data inicial</label><input type="date" value=${rmDe} onChange=${e => setRmDe(e.target.value)} className="p-2 border border-slate-300 rounded text-sm" /></div>
+                                <div><label className="block text-xs font-medium text-slate-600 mb-1">Data final</label><input type="date" value=${rmAte} onChange=${e => setRmAte(e.target.value)} className="p-2 border border-slate-300 rounded text-sm" /></div>
+                                <label className="flex items-center gap-2 text-sm text-slate-700 pb-2"><input type="checkbox" checked=${rmOcultar} onChange=${e => setRmOcultar(e.target.checked)} /> Ocultar valores (para entregar ao cliente)</label>
+                            </div>
+                            ${rmMsg && html`<div className="text-sm text-red-600">${rmMsg}</div>`}
+                            <button onClick=${rmGerar} disabled=${gerando} className=${'px-5 py-2.5 rounded-lg text-sm font-bold text-white ' + (gerando ? 'bg-slate-400' : 'bg-emerald-600 hover:bg-emerald-700')}><i className="ph-bold ph-file-xls"></i> Gerar relatório</button>
+                        </div>
+                        ${gerando && html`<div className="bg-white p-4 rounded-xl border border-slate-200 text-sm text-slate-600 flex items-center gap-2"><i className="ph ph-spinner animate-spin text-xl text-emerald-600"></i> ${j.fase || 'Gerando...'} — pode levar alguns minutos; não feche esta tela.</div>`}
+                        ${j && j.state === 'erro' && html`<div className="bg-red-50 border border-red-200 text-red-700 p-4 rounded-xl text-sm"><b>Não foi possível gerar:</b> ${j.erro}</div>`}
+                        ${j && j.state === 'ok' && j.resumo && html`
+                            <div className="bg-white p-4 rounded-xl border border-emerald-300 space-y-2">
+                                <div className="text-sm text-slate-700"><b>${j.resumo.equipamentos}</b> equipamentos com nº de série · <b>${j.resumo.entradas}</b> entradas em manutenção · <b>${(j.resumo.semSerie || []).length}</b> OS sem nº de série${(j.resumo.semSerie || []).length ? ' (' + j.resumo.semSerie.join(', ') + ')' : ''}</div>
+                                ${(j.resumo.possiveisDigitacao || []).length > 0 && html`<div className="text-xs text-amber-700">Conferir possível erro de digitação em série: ${j.resumo.possiveisDigitacao.map(p => p.join(' × ')).join(' ; ')} (detalhes na aba Leia-me)</div>`}
+                                ${(j.resumo.cobrancaEmDobro || []).length > 0 && html`<div className="text-xs text-red-600 font-medium">Alerta: possível cobrança em dobro em ${j.resumo.cobrancaEmDobro.length} entrada(s) (veja o Leia-me).</div>`}
+                                <button onClick=${rmBaixar} className="px-5 py-2.5 rounded-lg text-sm font-bold text-white bg-blue-600 hover:bg-blue-700"><i className="ph-bold ph-download-simple"></i> Baixar Excel</button>
+                            </div>`}
+                    </div>`;
             };
 
             const renderRelatorios = () => {
@@ -10335,6 +11332,57 @@ HTML_PAGE = """
                 setCurrentOs(prev => prev && prev.id === osId ? { ...prev, testeMidias: lista } : prev);
                 setOsDrafts(prev => (prev || []).map(o => o.id === osId ? { ...o, testeMidias: lista } : o));
             };
+            // Anexa um arquivo do teste na OS do Omie. Devolve '' se deu certo, senão a mensagem de erro.
+            const midiaParaOmie = async (osId, m, forcar) => {
+                const setProg = (p) => setMidiaProg(prev => { const n = { ...prev }; if (p) n[m.id] = p; else delete n[m.id]; return n; });
+                try {
+                    setProg({ pct: 0, fase: 'preparando' });
+                    const r = await fetch('/api/os/' + osId + '/teste-midia/' + m.id + '/omie' + (forcar ? '?forcar=1' : ''), { method: 'POST', headers: { 'Authorization': auth.token } });
+                    let d = null; try { d = await r.json(); } catch (e) {}
+                    if (!r.ok || !d || !d.success) { setProg(null); return (d && d.error) || 'falha ao falar com o Omie'; }
+                    if (d.ja) { setProg(null); return ''; }
+                    // acompanha o envio (roda em segundo plano no servidor) até terminar
+                    let falhas = 0;
+                    for (;;) {
+                        await new Promise(res => setTimeout(res, 1200));
+                        let s = null;
+                        try {
+                            const rs = await fetch('/api/os/' + osId + '/teste-midia/' + m.id + '/omie/status', { headers: { 'Authorization': auth.token } });
+                            s = await rs.json(); falhas = 0;
+                        } catch (e) { if (++falhas > 20) { setProg(null); return 'perdi a conexão com o Smart (o envio pode ter continuado: confira no Omie)'; } continue; }
+                        if (s.state === 'ok') { setProg(null); return ''; }
+                        if (s.state === 'erro') { setProg(null); return s.erro || 'o Omie recusou'; }
+                        if (s.state === 'nenhum') { setProg(null); return 'o envio foi interrompido (servidor reiniciou?). Tente de novo.'; }
+                        const pct = s.total ? Math.min(99, Math.round(100 * s.sent / s.total)) : 0;
+                        setProg({ pct, fase: s.fase });
+                    }
+                } catch (e) { setProg(null); return 'erro de conexão'; }
+            };
+            const reenviarMidiaOmie = async (osId, m) => {
+                setMidiaEnviando(osId);
+                const e = await midiaParaOmie(osId, m, true);
+                setMidiaEnviando(null);
+                if (e) alert('Não foi ao Omie: ' + e);
+                const os = (osDrafts || []).find(x => x.id === osId);
+                const lista = ((os && os.testeMidias) || []).map(x => x.id === m.id ? { ...x, omie: e ? { ok: false, erro: e } : { ok: true } } : x);
+                atualizarMidiasLocal(osId, lista);
+                fetchTeste();
+            };
+            const enviarPendentesOmie = async (osId, pend) => {
+                setMidiaEnviando(osId);
+                const erros = [];
+                const os = (osDrafts || []).find(x => x.id === osId);
+                let lista = (os && os.testeMidias) || [];
+                for (const m of pend) {
+                    const e = await midiaParaOmie(osId, m, false);
+                    if (e) { erros.push((m.legenda || m.nome) + ': ' + e); if (/bloque/i.test(e)) break; }   // Omie bloqueou: não insiste
+                    else lista = lista.map(x => x.id === m.id ? { ...x, omie: { ok: true } } : x);
+                }
+                setMidiaEnviando(null);
+                atualizarMidiasLocal(osId, lista);
+                fetchTeste();
+                if (erros.length) alert('Alguns vídeos não foram ao Omie:\\n\\n' + erros.join('\\n'));
+            };
             const enviarMidiasTeste = async (osId, fileList) => {
                 const arquivos = Array.from(fileList || []);
                 if (!arquivos.length) return;
@@ -10361,7 +11409,15 @@ HTML_PAGE = """
                         let d = null;
                         try { d = await r.json(); } catch (e) {}
                         if (!r.ok || !d || !d.success) erros.push(arq.name + ': ' + ((d && d.error) || (r.status === 413 ? 'arquivo grande demais' : 'falha no envio')));
-                        else lista = d.midias;
+                        else {
+                            lista = d.midias;
+                            const novo = lista[lista.length - 1];
+                            if (novo && novo.tipo === 'video') {   // vídeo vai também para os Anexos da OS no Omie
+                                const e2 = await midiaParaOmie(osId, novo, false);
+                                if (e2) erros.push(arq.name + ': guardado no Smart, mas NÃO foi ao Omie (' + e2 + '). Use "Reenviar ao Omie".');
+                                else lista = lista.map(x => x.id === novo.id ? { ...x, omie: { ok: true } } : x);
+                            }
+                        }
                     } catch (e) { erros.push(arq.name + ': erro de conexão'); }
                 }
                 setMidiaEnviando(null);
@@ -10387,6 +11443,13 @@ HTML_PAGE = """
                     <div className="border border-slate-200 rounded-lg p-3 bg-slate-50">
                         <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
                             <div className="text-sm font-bold text-slate-700 flex items-center gap-1"><i className="ph-fill ph-camera text-indigo-600"></i> Fotos e vídeos do teste <span className="text-xs font-normal text-slate-400">(${lista.length})</span></div>
+                            ${(() => {
+                                const pend = lista.filter(x => x.tipo === 'video' && !(x.omie && x.omie.ok));
+                                if (!pend.length || !o.omieOsId) return '';
+                                return html`<button disabled=${enviando} onClick=${() => enviarPendentesOmie(o.id, pend)} className="bg-orange-500 hover:bg-orange-600 disabled:opacity-60 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1">
+                                    <i className=${'ph-bold ' + (enviando ? 'ph-spinner animate-spin' : 'ph-cloud-arrow-up')}></i> ${enviando ? 'Enviando ao Omie…' : 'Enviar ' + pend.length + (pend.length > 1 ? ' vídeos' : ' vídeo') + ' ao Omie'}
+                                </button>`;
+                            })()}
                             ${anexar ? html`
                                 <label className=${`cursor-pointer bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 ${enviando ? 'opacity-60 pointer-events-none' : ''}`}>
                                     <i className=${'ph-bold ' + (enviando ? 'ph-spinner animate-spin' : 'ph-paperclip')}></i> ${enviando ? 'Enviando…' : 'Anexar fotos / vídeos'}
@@ -10395,7 +11458,7 @@ HTML_PAGE = """
                         </div>
                         ${lista.length ? html`
                             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                                ${lista.map(m => html`<${MidiaItem} key=${m.id} osId=${o.id} m=${m} token=${auth.token} podeExcluir=${m.por === auth.username || auth.role === 'admin'} onExcluir=${(x) => excluirMidiaTeste(o.id, x)} />`)}
+                                ${lista.map(m => html`<${MidiaItem} key=${m.id} osId=${o.id} m=${m} token=${auth.token} podeExcluir=${m.por === auth.username || auth.role === 'admin'} onExcluir=${(x) => excluirMidiaTeste(o.id, x)} onOmie=${o.omieOsId ? (x) => reenviarMidiaOmie(o.id, x) : null} prog=${midiaProg[m.id]} />`)}
                             </div>` : html`<p className="text-xs text-slate-400">Nenhum anexo ainda. Registre o teste com fotos ou vídeos; ficam guardados nesta OS.</p>`}
                         ${anexar ? html`<p className="text-[11px] text-slate-400 mt-2">Fotos (JPG, PNG, WebP) e vídeos (MP4, MOV, WebM até 50 MB). Até 20 anexos por OS.</p>` : ''}
                     </div>`;
@@ -11699,6 +12762,29 @@ HTML_PAGE = """
                             </div>
                         </header>
 
+                        ${(reqAlmox && reqPendQtd > 0 && reqPendKey !== reqOverlayVisto) && html`
+                            <div style=${{ position: 'fixed', inset: 0, zIndex: 99999, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}>
+                                <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-6 border-4 border-orange-500">
+                                    <div className="flex items-center gap-3 mb-3">
+                                        <i className="ph-fill ph-bell-ringing text-orange-500 text-4xl"></i>
+                                        <h2 className="text-xl font-bold text-slate-800">${reqPendQtd === 1 ? 'Nova requisição pendente' : (reqPendQtd + ' requisições pendentes')}</h2>
+                                    </div>
+                                    <div className="space-y-2 mb-4 max-h-64 overflow-y-auto">
+                                        ${reqPend.slice(0, 5).map(r => html`
+                                            <div key=${r.id} className="bg-orange-50 border border-orange-200 rounded-lg px-3 py-2 text-sm">
+                                                <b>${r.numero}</b> ${r.urgencia === 'urgente' ? html`<span className="ml-1 bg-red-600 text-white text-xs font-bold px-1.5 py-0.5 rounded">URGENTE</span>` : ''}
+                                                <div className="text-slate-600">${r.solicitante} · ${(r.itens || []).length} item(ns)${r.osRotulo ? (' · ' + r.osRotulo) : ''}</div>
+                                            </div>`)}
+                                        ${reqPendQtd > 5 && html`<div className="text-xs text-slate-500">e mais ${reqPendQtd - 5}...</div>`}
+                                    </div>
+                                    ${(!window.__reqCtx || window.__reqCtx.state !== 'running') && html`<div className="text-xs text-amber-700 bg-amber-50 rounded px-2 py-1 mb-3">Para ouvir o bipe, clique em qualquer lugar da tela uma vez.</div>`}
+                                    <div className="text-xs text-slate-500 mb-3">O bipe repete até a requisição ser atendida (iniciar separação, recusar ou cancelar).</div>
+                                    <div className="flex gap-2 justify-end">
+                                        <button onClick=${() => { setReqSilencio(Date.now() + 5 * 60 * 1000); setReqOverlayVisto(reqPendKey); }} className="px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100 rounded-lg">Silenciar 5 min</button>
+                                        <button onClick=${() => { setReqOverlayVisto(reqPendKey); setActiveTab('requisicoes'); }} className="px-4 py-2 text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 rounded-lg">Ver requisições</button>
+                                    </div>
+                                </div>
+                            </div>`}
                         <div data-solo-req=${soRequisicoes ? "1" : undefined} className="flex flex-nowrap overflow-x-auto md:flex-wrap md:overflow-x-visible gap-1 mb-6 bg-slate-200 p-1 rounded-xl w-full md:w-fit md:max-w-full">
                             <button onClick=${() => setActiveTab('report')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'report' ? 'bg-white text-blue-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-file-text"></i> Preencher Laudo</button>
                             <button onClick=${() => setActiveTab('executar')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'executar' ? 'bg-white text-orange-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
@@ -11719,6 +12805,9 @@ HTML_PAGE = """
                                 ${(() => { const n = (requisicoes || []).filter(r => r.status === 'pendente').length; return (reqAlmox && n) ? html`<span className="bg-orange-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">${n}</span>` : ''; })()}
                             </button>
 
+                            ${(auth.role === 'admin' || auth.role === 'admin_master') && html`
+                                <button onClick=${() => setActiveTab('relmanut')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'relmanut' ? 'bg-white text-emerald-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}><i className="ph-bold ph-file-xls"></i> Relatório por equipamento</button>
+                            `}
                             ${auth.role === 'admin' && html`
                                 <button onClick=${() => setActiveTab('robo')} className=${`whitespace-nowrap px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all ${activeTab === 'robo' ? 'bg-white text-amber-700 shadow' : 'text-slate-600 hover:bg-slate-300'}`}>
                                     <i className="ph-bold ph-robot"></i> Robô
@@ -11738,6 +12827,7 @@ HTML_PAGE = """
                             ${activeTab === 'os' ? renderOS() : ''}
                             ${activeTab === 'analises' ? renderAnalises() : ''}
                             ${activeTab === 'requisicoes' ? renderRequisicoes() : ''}
+                            ${activeTab === 'relmanut' && (auth.role === 'admin' || auth.role === 'admin_master') ? renderRelManut() : ''}
                             ${activeTab === 'robo' && auth.role === 'admin' ? renderRobo() : ''}
                             ${activeTab === 'relatorios' && auth.role === 'admin' ? renderRelatorios() : ''}
                             ${activeTab === 'settings' && auth.role === 'admin' ? renderSettings() : ''}

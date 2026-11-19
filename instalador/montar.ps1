@@ -30,7 +30,7 @@ Write-Host "2/4 Copiando só as bibliotecas que o servidor usa..."
 $sp = Join-Path $venv "Lib\site-packages"
 $spd = Join-Path $py "Lib\site-packages"
 New-Item -ItemType Directory -Force $spd | Out-Null
-$pacotes = "bcrypt", "blinker", "chardet", "click", "colorama", "flask", "itsdangerous", "jinja2", "markupsafe", "PIL", "reportlab", "waitress", "werkzeug"
+$pacotes = "bcrypt", "blinker", "chardet", "click", "colorama", "flask", "itsdangerous", "jinja2", "markupsafe", "openpyxl", "et_xmlfile", "PIL", "reportlab", "waitress", "werkzeug"
 foreach ($p in $pacotes) {
     if (-not (Test-Path (Join-Path $sp $p))) { throw "Pacote ausente no .venv: $p" }
     robocopy (Join-Path $sp $p) (Join-Path $spd $p) /E /XD __pycache__ /NFL /NDL /NJH /NJS /NP | Out-Null
@@ -48,7 +48,7 @@ robocopy (Join-Path $raiz "servidor_local") (Join-Path $app "servidor_local") /E
 $tmp = Join-Path $env:TEMP ("sr_montagem_" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory $tmp | Out-Null
 $env:DATA_FILE = Join-Path $tmp "d.json"
-$teste = "import sys; sys.path.insert(0, r'$app'); import flask, bcrypt, reportlab, PIL, waitress, werkzeug, smart_report; " +
+$teste = "import sys; sys.path.insert(0, r'$app'); import flask, bcrypt, reportlab, PIL, waitress, werkzeug, openpyxl, smart_report; " +
          "assert r'$staging' in flask.__file__, flask.__file__; print('pacote montado OK, flask em', flask.__file__)"
 & (Join-Path $py "python.exe") -I -c $teste
 if ($LASTEXITCODE -ne 0) { throw "O pacote montado não importa o servidor." }
